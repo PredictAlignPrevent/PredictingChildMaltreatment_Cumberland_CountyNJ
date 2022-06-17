@@ -1,0 +1,221 @@
+<?xml version="1.0" encoding="UTF-8"?><metadata>
+    <idinfo>
+        <citation>
+            <citeinfo>
+                <origin/>
+                <pubdate>20210601</pubdate>
+                <title>Bus Stops of NJ Transit</title>
+                <geoform>vector digital data</geoform>
+            </citeinfo>
+        </citation>
+        <descript>
+            <abstract>This layer was created and maintained by the GIS Department. The purpose of this layer is to indicate all active bus stops within the current bus service. Bus stops that serve multiple routes contain a separate record for each route. The layer’s Projected Coordinate System is NAD_1983_StatePlane_New_Jersey_FIPS_2900 and Geographic Coordinate System is GCS_North_American_1983. Data represents scheduled, not necessarily operated stops.</abstract>
+            <purpose>Bus stops from the October 2021 service change. Each record indicates an active bus stop during this service change.</purpose>
+        </descript>
+        <timeperd>
+            <timeinfo>
+                <sngdate>
+                    <caldate>20210601</caldate>
+                </sngdate>
+            </timeinfo>
+            <current>Unknown</current>
+        </timeperd>
+        <status>
+            <progress>Complete</progress>
+            <update>Quarterly</update>
+        </status>
+        <spdom>
+            <bounding>
+                <westbc>-75.545484</westbc>
+                <eastbc>-73.935626</eastbc>
+                <northbc>41.254893</northbc>
+                <southbc>38.930292</southbc>
+            </bounding>
+        </spdom>
+        <keywords>
+            <theme>
+                <themekt>None</themekt>
+                <themekey>Bus</themekey>
+                <themekey>Bus Service Change</themekey>
+                <themekey>Bus Route</themekey>
+                <themekey>Bus Stop</themekey>
+            </theme>
+            <theme>
+                <themekt>ISO 19115 Topic Categories</themekt>
+                <themekey>transportation</themekey>
+            </theme>
+            <place>
+                <placekt>None</placekt>
+                <placekey>New Jersey</placekey>
+            </place>
+            <temporal>
+                <tempkt>None</tempkt>
+                <tempkey>June</tempkey>
+                <tempkey>2021</tempkey>
+            </temporal>
+        </keywords>
+        <accconst>Other Constraints</accconst>
+        <useconst>For any inquiries, please contact NJ Transit GIS department.</useconst>
+        <ptcontac>
+            <cntinfo>
+                <cntorgp>
+                    <cntorg>NJ Transit</cntorg>
+                    <cntper>Aaron Reisner</cntper>
+                </cntorgp>
+                <cntpos>Senior Director of GIS</cntpos>
+                <cntaddr>
+                    <addrtype>mailing</addrtype>
+                    <address>1 Penn Plaza East</address>
+                    <city>Newark</city>
+                    <state>NJ</state>
+                    <postal>07105</postal>
+                    <country>US</country>
+                </cntaddr>
+                <cntvoice>(973) 491-7606</cntvoice>
+                <cntemail>areisner@njtransit.com</cntemail>
+            </cntinfo>
+        </ptcontac>
+        <datacred>NJ Transit GIS Department.</datacred>
+        <native>Version 6.2 (Build 9200) ; Esri ArcGIS 10.8.0.12790</native>
+    </idinfo>
+    <spdoinfo>
+        <direct>Vector</direct>
+        <ptvctinf>
+            <sdtsterm>
+                <sdtstype>Composite object</sdtstype>
+                <ptvctcnt>30447</ptvctcnt>
+            </sdtsterm>
+        </ptvctinf>
+    </spdoinfo>
+    <eainfo>
+        <detailed>
+            <enttyp>
+                <enttypl>Bus Stops of NJ Transit</enttypl>
+                <enttypd>Feature Class</enttypd>
+                <enttypds>ESRI</enttypds>
+            </enttyp>
+            <attr>
+                <attrlabl>FID</attrlabl>
+                <attrdef>Internal feature number.</attrdef>
+                <attrdefs>Esri</attrdefs>
+                <attrdomv>
+                                        					
+                    
+                    <udom>Sequential unique whole numbers that are automatically generated.</udom>
+                                        				
+                
+                </attrdomv>
+            </attr>
+            <attr>
+                <attrlabl>Shape</attrlabl>
+                <attrdef>Feature geometry.</attrdef>
+                <attrdefs>Esri</attrdefs>
+                <attrdomv>
+                                        					
+                    
+                    <udom>Coordinates defining the features.</udom>
+                                        				
+                
+                </attrdomv>
+            </attr>
+            <attr>
+                <attrlabl>COUNTY</attrlabl>
+                <attrdef>County</attrdef>
+                <attrdefs>NJ Transit</attrdefs>
+            </attr>
+            <attr>
+                <attrlabl>DATE_STAMP</attrlabl>
+                <attrdef>Date of PatternStop run</attrdef>
+                <attrdefs>NJ Transit</attrdefs>
+            </attr>
+            <attr>
+                <attrlabl>DESCRIPTIO</attrlabl>
+                <attrdef>Road  intersection of bus stop.</attrdef>
+                <attrdefs>NJ Transit</attrdefs>
+            </attr>
+            <attr>
+                <attrlabl>DIRECTION_</attrlabl>
+                <attrdef>Direction of line at stop:
+In-Inbound
+Ou-Outbound</attrdef>
+                <attrdefs>NJ Transit</attrdefs>
+            </attr>
+            <attr>
+                <attrlabl>DIST</attrlabl>
+                <attrdef>Distance</attrdef>
+                <attrdefs>NJ Transit</attrdefs>
+            </attr>
+            <attr>
+                <attrlabl>DLAT_GIS</attrlabl>
+                <attrdef>Latitude coordinate</attrdef>
+                <attrdefs>NJ Transit</attrdefs>
+            </attr>
+            <attr>
+                <attrlabl>DLONG_GIS</attrlabl>
+                <attrdef>Longitude coordinate</attrdef>
+            </attr>
+            <attr>
+                <attrlabl>LINE</attrlabl>
+                <attrdef>Line</attrdef>
+                <attrdefs>NJ Transit</attrdefs>
+            </attr>
+            <attr>
+                <attrlabl>MB_DIR</attrlabl>
+                <attrdef>Midblock direction</attrdef>
+                <attrdefs>NJ Transit</attrdefs>
+            </attr>
+            <attr>
+                <attrlabl>MUNICIPALI</attrlabl>
+                <attrdef>Municipality</attrdef>
+                <attrdefs>NJ Transit</attrdefs>
+            </attr>
+            <attr>
+                <attrlabl>PLACE_NO</attrlabl>
+                <attrdef>Bus stop timing point</attrdef>
+                <attrdefs>NJ Transit</attrdefs>
+            </attr>
+            <attr>
+                <attrlabl>STOP_NUM</attrlabl>
+                <attrdef>Stop number</attrdef>
+                <attrdefs>NJ Transit</attrdefs>
+            </attr>
+            <attr>
+                <attrlabl>STOP_TYPE</attrlabl>
+                <attrdef>NS - Near side
+FS - Far side
+MB - Mid-block</attrdef>
+                <attrdefs>NJ Transit</attrdefs>
+            </attr>
+            <attr>
+                <attrlabl>STREET_DIR</attrlabl>
+                <attrdef>Cardinal direction towards which bus is travelling.</attrdef>
+                <attrdefs>NJ Transit</attrdefs>
+            </attr>
+        </detailed>
+    </eainfo>
+    <metainfo>
+        <metd>20210601</metd>
+        <metc>
+            <cntinfo>
+                <cntorgp>
+                    <cntorg>NJTransit</cntorg>
+                    <cntper>Aaron Reisner</cntper>
+                </cntorgp>
+                <cntpos>Senior Director of GIS</cntpos>
+                <cntaddr>
+                    <addrtype>mailing</addrtype>
+                    <address>1 Penn Plaza East</address>
+                    <city>Newark</city>
+                    <state>NJ</state>
+                    <postal>07105</postal>
+                    <country>US</country>
+                </cntaddr>
+                <cntvoice>(973) 491-7606</cntvoice>
+                <cntemail>areisner@njtransit.com</cntemail>
+            </cntinfo>
+        </metc>
+        <metstdn>FGDC Content Standard for Digital Geospatial Metadata</metstdn>
+        <metstdv>FGDC-STD-001-1998</metstdv>
+        <mettc>local time</mettc>
+    </metainfo>
+</metadata>

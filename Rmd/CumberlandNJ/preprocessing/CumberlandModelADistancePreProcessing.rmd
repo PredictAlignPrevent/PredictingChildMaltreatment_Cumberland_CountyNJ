@@ -1,0 +1,228 @@
+---
+title: "Cumberland Distance Pre-Processing"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '6'
+  html_document:
+    toc: yes
+    theme: united
+    toc_depth: 6
+    toc_float: yes
+---
+
+```{r clean, include=FALSE}
+# a clean slate each time
+rm(list=ls())
+```
+
+```{r setup, include=TRUE, eval=TRUE, warning=FALSE, messages=FALSE, echo=FALSE, cache=FALSE}
+# default to suppress all code chunks unless explicitly indicated
+knitr::opts_chunk$set(include=TRUE, warning=FALSE, error=FALSE, results='hide',
+                      message=FALSE, echo=FALSE, cache=TRUE, fig.align="center")
+```
+
+# Risk and Protective Factor Data Processing Description
+
+We use half-mile and landscan to aggregate the geocoded risk and protective factor data. These aggregations are then used to contextualize child maltreatment risk in terms of these factors. 
+
+# Environment setup
+
+The following packages define the environment required for this workflow:
+
+```{r load-pkgs, include=TRUE, echo=TRUE}
+library("sf")            # Spatial data objects and methods
+library("ggmap")         # ggplot2 addon for base maps
+library("cowplot")
+library("raster")        # cell-based spatial operations
+library("tidyverse")     # data manipulation framework
+library("knitr")         # for kable table
+library("viridis")
+library("viridisLite")
+library("tidycensus")
+library("tigris")
+library("lubridate")
+library("readr")
+library("units")
+```
+
+```{r load-custom-fxns, include=TRUE, echo=TRUE}
+source('~/predict-align-prevent/R/sourcefiles/fishnet.r')
+source('~/predict-align-prevent/R/sourcefiles/map_themes.r')
+```
+
+```{r geometry-constants, include=TRUE, echo=TRUE}
+WGS84 = 4326
+NJ_PLANAR = 'ESRI:102311'
+```
+
+```{r neighborhoods-basemaps, include=TRUE, echo=TRUE}
+# load and prep general purpose data
+nj <- load_neighborhood(
+  url='https://opendata.arcgis.com/datasets/5f45e1ece6e14ef5866974a7b57d3b95_1.geojson', 
+  crs=NJ_PLANAR
+  )
+cumberland <- extract_area(nj)
+cumberland_bm <- collect_basemap(cumberland, crs=WGS84)
+```
+
+## Maltreatment data
+
+### Load data and aggregate
+
+Each row in the `geocoded_incidents` dataframe is a single allegation. There may be multiple allegations per child, multiple allegations per call to NJ DCF, and multiple children with multiple allegations per child, and repeated allegations on different dates at the same address.
+
+The data do not have a unique child identifier, so we instead assume that children can be uniquely identified by their age and address. Of course, there will be some exceptions to this rule for which we cannot directly account. We aggregate on child age and address to collapse these multiple-allegation referrals into a single referral.
+
+We consider referrals made on different dates to be distinct child referrals, so one child may be represented multiple times in the final dataset if referrals are made on different days.
+
+After estimating the number of referrals by aggregating on date, child age, and address, we make an additional aggregation date and child age to get a yearly count of all unique referrals for each address.
+
+```{r load-incidents, include=TRUE, echo=TRUE}
+# incidents data
+geocoded_incidents <- read.csv('~/PredictAlign/171819_NJ_geocoded_incidents.csv')
+geocoded_incidents$intake_year <- lubridate::year(geocoded_incidents$Intake.RcvdDate)
+```
+
+Aggregation to child-referrals is performed here. New Jersey state FIPS code is 34; Cumberland County FIPS code is 11.
+
+```{r agg-referrals, include=TRUE, echo=TRUE}
+child_referrals <- geocoded_incidents %>% 
+  filter(state_fips==34 & county_fips==11 & match_indicator=='Match') %>%
+  group_by(intake_year, Intake.RcvdDate, Intake.ChildAge, full_addr, 
+           lat, lon, state_fips, county_fips) %>% 
+  summarise(incident_count=n())
+
+annual_referrals_per_address <- child_referrals %>%
+  group_by(intake_year, full_addr, lat, lon) %>%
+  summarise(incident_count=sum(incident_count))
+
+annual_referrals_shp <- create_incidents_sf(
+  annual_referrals_per_address, 
+  initial_crs=WGS84, 
+  transform_crs=NJ_PLANAR)
+```
+
+## Assign incidents to fishnet grid cell
+
+```{r fishnet-maltrt, include=TRUE, echo=TRUE}
+fishnet <- st_read('~/PredictAlign/PredictAlignFishnets/cumberland_county_halfmi_fishnet_annual_pop.shp')
+
+# years in referral, risk, and protective data (incidents only span 2017-2019)
+years <- 2017:2019
+referral_fishnets_list = list() # for storing referral fishnets
+for(i in seq_along(years)){
+  # filter referrals and fishnets by year
+  year_referrals <- annual_referrals_shp %>% filter(intake_year==years[i])
+  year_fishnet <- fishnet %>% filter(intk_yr==years[i])
+  # join referrals to fishnet cells
+  referral_fishnets <- st_join(year_referrals, year_fishnet, join=st_within)
+  referral_fishnets$intake_year <- years[i]
+  referral_fishnets_list[[as.character(i)]] <- referral_fishnets
+}
+all_referrals <- bind_rows(referral_fishnets_list)
+all_referrals <- all_referrals %>% select(-untls__, -intk_yr, -full_addr)
+print(names(all_referrals))
+all_referrals <- tidyr::extract(
+  all_referrals, geometry, into = c('lat', 'lon'), 
+  '\\((.*),(.*)\\)', remove=T, conv=T)
+all_referrals <- all_referrals[, unique(names(all_referrals))]
+all_referrals <- st_as_sf(all_referrals)
+```
+```{r safe-data, eval=FALSE}
+st_write(all_referrals, '~/PredictAlign/PredictAlignFishnets/cumberland_modelA_maltreatment_location_and_netID.shp')
+```
+
+## Map of referral counts by location
+
+```{r map-referrals, include=TRUE, echo=TRUE}
+annual_referral_map <- ggmap(cumberland_bm) + 
+  ggplot2::geom_sf(
+    data=st_transform(annual_referrals_shp, crs=WGS84),
+    inherit.aes = FALSE, aes(color=incident_count)
+  ) + facet_grid(~ intake_year)
+    
+annual_referral_map
+```
+
+# Risk and protective factors
+
+Risk and protective factor data have already been saved with grid cell ID assigned. Next we reload those datasets, aggregate by unique address (as noted by latitude/longitude), and combine all data into a single data frame.
+
+The business location data are not stratified by year, and additionally have information about the business type. Because some of the business types are protective and others are not, we do not aggregate over the business type.
+
+## Load data
+
+```{r load-risk-protect, include=TRUE, echo=TRUE}
+st_pol <- read.csv('~/PredictAlign/PredictAlignFishnets/cleaned_data/St_Pol_crime_with_netid_nj_planar_esri_102311.csv')
+risk_protect <- read.csv('~/PredictAlign/PredictAlignFishnets/cleaned_data/risk_protect_factors_with_netid_nj_planar_esri_102311.csv')
+bridgeton_viol <- read.csv('~/PredictAlign/PredictAlignFishnets/cleaned_data/Bridgeton_violations_all_geocoded_with_netid_nj_planar_esri_102311.csv')
+millville_viol <- read.csv('~/PredictAlign/PredictAlignFishnets/cleaned_data/Millville_violations_all_geocoded_with_netid_nj_planar_esri_102311.csv')
+bridgeton_crime <- read.csv('~/PredictAlign/PredictAlignFishnets/cleaned_data/Bridgeton_Crime_all_geocoded_with_netid_nj_planar_esri_102311.csv')
+```
+
+## Aggregate data
+
+```{r agg-risk-protect, include=TRUE, echo=TRUE}
+st_pol_agg <- st_pol %>% 
+  filter(fn_width=="0.5") %>% 
+  group_by(data_lon, data_lat, year, net_id) %>% summarise(count=n())
+st_pol_agg$source <- 'State Police crime data'
+st_pol_agg$year <- as.character(st_pol_agg$year)
+
+risk_protect_agg <- risk_protect %>% 
+  filter(fn_width=="0.5") %>% 
+  group_by(PrimarySIC6.Description, data_lon, data_lat, net_id) %>% summarise(count=n())
+risk_protect_agg$source <- 'risk and protective factors'
+risk_protect_agg$year <- 'Business Locations (no year)'
+
+bridgeton_viol_agg <- bridgeton_viol %>% 
+  filter(fn_width=="0.5") %>% 
+  group_by(data_lon, data_lat, net_id, year) %>% summarise(count=n())
+bridgeton_viol_agg$source <- 'Bridgeton violations'
+bridgeton_viol_agg$year <- as.character(bridgeton_viol_agg$year)
+
+millville_viol_agg <- millville_viol %>% 
+  filter(fn_width=="0.5") %>% 
+  group_by(data_lon, data_lat, net_id, year) %>% summarise(count=n())
+millville_viol_agg$source <- 'Millville violations'
+millville_viol_agg$year <- as.character(millville_viol_agg$year)
+
+bridgeton_crime_agg <- bridgeton_crime  %>% 
+  filter(fn_width=="0.5") %>% 
+  group_by(data_lon, data_lat, net_id, year) %>% summarise(count=n())
+bridgeton_crime_agg$source <- 'Bridgeton crime'
+bridgeton_crime_agg$year <- as.character(bridgeton_crime_agg$year)
+```
+
+## Combine aggregated datasets
+
+```{r combine-risk-protect, include=TRUE, echo=TRUE}
+all_risk_protective_by_location <- bind_rows(
+  st_pol_agg, bridgeton_crime_agg, bridgeton_viol_agg, millville_viol_agg, risk_protect_agg
+  )
+all_risk_protective_by_location <- all_risk_protective_by_location %>% arrange(source, year, net_id)
+names(all_risk_protective_by_location) <- c('lon', 'lat', 'year', 'net_id', 'count', 'source', 'business type if applicable')
+all_risk_protective_by_location <- st_as_sf(all_risk_protective_by_location, coords=c('lon', 'lat'), crs=NJ_PLANAR)
+```
+```{r save-risk-protect, eval=FALSE}
+st_write(
+  all_risk_protective_by_location, 
+  '~/PredictAlign/PredictAlignFishnets/cumberland_risk_protective_location_and_netID.shp'
+  )
+```
+
+
+## Map risk and protective factor counts
+
+We can map the risk and protective factors by year (business locations are mapped separately).
+
+```{r map-risk-protect, include=TRUE, echo=TRUE}
+annual_crime_map <- ggmap(cumberland_bm) + 
+  ggplot2::geom_sf(
+    data=st_transform(all_risk_protective_by_location, crs=WGS84),
+    inherit.aes = FALSE, aes(color=count)
+  ) + facet_grid(~ year)
+    
+annual_crime_map
+```

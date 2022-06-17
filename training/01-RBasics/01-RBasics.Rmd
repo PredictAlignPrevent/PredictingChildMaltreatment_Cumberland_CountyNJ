@@ -1,0 +1,483 @@
+---
+title: "R Basics"
+subtitle: "Prepared for PAP New Jersey Trainings"
+date: "February 3, 2022"
+author: Kelly Pierce, Texas Advanced Computing Center
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '6'
+  html_document:
+    toc: yes
+    theme: united
+    toc_depth: 6
+    toc_float: yes
+---
+
+```{r knit, include=FALSE}
+library(knitr)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This document contains brief descriptions of core R functionality. Examples are provided as code blocks. Code block results are printed below the code block, prefixed by `##`.
+
+```{r eval=FALSE}
+"This is a code block. Code blocks use different fonts and have light gray backgrounds. 
+They contain examples of valid R code."
+```
+
+`## The results of running a code block are shown underneath each block.`
+
+As you read through this document, follow along by typing the code block examples into an R console and running them yourself. Check that you get the same output as displayed in this document. 
+
+You will also find a series of exercises at the end of the document.
+
+# Basic R syntax
+
+## Math operations
+
+Basic arithmetic
+```{r}
+(17 * 0.35) ^ 1/3
+```
+
+Logarithms and exponentiation use the `log` and `exp` functions. The default base is `e`, with a value of approximately 2.71828.
+
+```{r}
+log(2.71828)
+```
+
+```{r}
+exp(1)
+```
+
+Specify the base of your logarithm with the `base` argument. Common logarithm bases have their own functions.
+
+```{r}
+log(10, base=10)
+log10(10)
+log2(10)
+```
+
+The modulo operator performs a division operation and returns the remainder. This can be helpful for identifying even vs odd numbers, or identifying factors of an integer value.
+
+```{r}
+print(10 %% 10)
+print(10 %% 6)
+print(10 %% 3)
+```
+## Logical operators
+
+Logical operators are used for value and/or variable comparisons.
+
+- Equivalent: `==`
+- Not equivalent: `!=`
+- Less than: `<`
+- Greater than: `>`
+- Or: `|`
+- And: `&`
+
+```{r}
+g = 12
+h = 13
+g == h
+```
+
+## Variables
+
+There are a few important properties of R variables:
+
+1. Variables are given values by the process of variable assignment
+2. Variables have different types
+3. Variables can be reused
+4. Variables are mutable; their values can be modified or changed
+
+### Variable assignment
+
+Assignment by convention uses the `<-` operator, with the variable name on the left and its assigned value on the right.
+
+```{r}
+a <- 100
+print(a)
+```
+
+### Variable types
+
+**Numeric variables** are integers and decimal values (also known as type "double", for double-precision floating point value). *For most of your work, this distinction is irrelevant,* but sometimes it does impact calculations so it's good to be aware this distinction exists. 
+
+The `typeof` function can be used to report the type of a variable. Recall variable `a` assigned above.
+
+```{r}
+typeof(a)
+```
+
+Even though `a` was assigned the value of "100" without a decimal, it is by default treated as a variable that can have decimals. If you need an integer data type, you can ask for one explicitly:
+
+```{r}
+b <- as.integer(100)
+typeof(b)
+```
+
+**Character strings** are text variables. They must be enclosed in either single or double quotes.
+
+```{r}
+d <- 'Hello world!'
+typeof(d)
+```
+
+**Logical** variables are `TRUE` or `FALSE`.
+
+```{r}
+e <- TRUE
+typeof(e)
+```
+
+```{r}
+f <- FALSE
+typeof(f)
+```
+
+### Missing values
+
+Variables of each data type (numeric, character and logical) can also take the value of `NA`: "not available". 
+- `NA` is not the same as 0
+- `NA` is not the same as ""
+- `NA` is not the same as FALSE
+
+Any operations (calculations or comparisons) that involve `NA` may or may not produce `NA`.
+
+### Variable reassignment and modification
+
+You can also assign variables the value of other variables. The code block below assigns variable `f` the value of `a` converted to an integer. This assignment does not change the value of `a`.
+
+```{r}
+g <- as.integer(a)
+print(typeof(g))
+print(typeof(a))
+```
+
+If we change the value of `a`, what happens to the value of `f`?
+
+```{r}
+a <- 'Now a is a character string'
+print(a)
+print(g)
+```
+
+The value of `f` remains unchanged because in R, variable assignment copies values rather than referencing them. For more details, see examples [here](https://www.oreilly.com/library/view/r-in-a/9781449358204/ch05s05.html).
+
+### Scalar vs vector variables
+
+So far we have considered only **scalar** variables -- variables with a single value. Variables can also hold multiple variables in vectors.
+
+We often use functions to create vector variables. The `c()` function combines values into vectors:
+
+```{r}
+my_vector <- c(1, 1, 2, 3, 5, 8)
+print(my_vector)
+```
+
+The `seq()` function makes a sequence. Its arguments are start, stop, and step.
+
+```{r}
+my_sequence <- seq(30, 20, -1)
+print(my_sequence)
+```
+
+The `length()` function returns the length of a vector:
+
+```{r}
+print(length(my_vector))
+print(length(my_sequence))
+```
+
+# Getting help with functions
+
+You've seen a few examples of functions so far: `print()`, `typeof()`, `c()` and `seq()`. There are many, many functions in R and its optional packages. For most, you can get access standardized documentations for functions with the `help()` function or `?` operator.
+
+```{r}
+help("c")
+```
+
+```{r}
+?c
+```
+
+The help documentation has several sections of which these are typically the most informative.
+
+1. "Description" is a basic description of the function.
+2. "Usage" shows brief examples of the function call.
+3. "Arguments" lists the arguments (the variables or data you pass to the function, upon which the function does work). This section will also explain the expected types for argument values and the argument default values (if any).
+4. "Details" expands on the description a bit.
+5. "Value" describes the value the function returns.
+6. "Examples" shows usage examples in more detail.
+
+# Flow control
+
+Flow control helps you move data through your script with looping and conditional statements. 
+
+## Loops
+
+### For-loops
+
+For-loops allow you to perform actions (like evaluate functions) on iterable variables (like vectors) one element at a time. For-loops terminate when all elements in the iterable have been acted on:
+
+```{r}
+for(i in 1:10){
+  print(i*i)
+}
+```
+
+### While-loops
+
+While-loops also work on iterables, but have terminate when a pre-specified condition is met.
+
+```{r}
+i <- 1
+while(i < 6){
+  print(i)
+  i <- i + 1
+}
+```
+
+If you don't select a suitable termination condition, your while-loop could continue indefinitely. For example, this code would loop infinitely:
+
+```{r eval=FALSE}
+j <- 1
+while(j < 6){
+  print(j)
+  j <- j - 1
+}
+```
+
+## If/Else conditionals
+
+If/Else statements are used to evaluate mutually exclusive conditions:
+
+```{r}
+bigger_than_breadbox <- FALSE
+if(bigger_than_breadbox == TRUE){
+  print('The item bigger than breadbox')
+}else{
+  print('The item is not bigger than a breadbox')
+}
+```
+
+If/Else statements can be extended to more than two mutually exclusive conditions with an `else if` clause:
+
+```{r}
+object <- 'plastic'
+
+if(object == 'vegetable'){
+  print('Object is a vegetable')
+}else if(object == 'animal'){
+  print('Object is an animal')
+}else if(object == 'mineral'){
+  print('Object is a mineral!')
+}else{
+  print('Object must be something else.')
+}
+```
+
+# Basic data structure
+
+## Vectors
+
+We briefly discussed vectors above, in contrast to scalar variables. Vectors are ordered collections of data of the same type. Elements in vectors are usually accessed by index. In R, indexing starts with "1".
+
+Recall the `my_vector` variable defined above. Use square brackets to reference elements in the list by their index number:
+```{r}
+print(my_vector)
+print(my_vector[1])
+print(my_vector[4])
+```
+
+We can perform mathematical operations on vectors. We can multiply each value in the vector by a scalar value:
+```{r}
+my_vector*3
+```
+
+We can also perform aggregations on the vector:
+```{r}
+sum(my_vector)
+```
+
+## Matrices
+
+Matrices have a `[row, column]` data structure; like vectors, all elements in a matrix must have the same data type. Matrices can be used for linear algebra computations.
+
+```{r}
+A = matrix(c(1, 2, 3, 4, 5, 6, 7, 8, 9), nrow=3)
+A
+```
+
+Extract single elements from a matrix with their `[row, column]` positional indexes.
+
+```{r}
+A[2, 2]
+```
+
+Slice out rows and columns by specifying only the row or column number:
+
+```{r}
+print(A[2, ])
+print(A[ ,2])
+```
+
+Perform matrix multiplication with the `%*%` operator:
+
+```{r}
+x <- c(1, 2, 3)
+A %*% x
+```
+
+## Lists
+
+Lists are a special type of vector containing ordered key-value pairs and can contain arbitrary data types. Elements in lists can be accessed by key or by positional index.
+
+```{r}
+phonebook <- list(name="Jenny", number="867-5309")
+print(phonebook$name)
+print(phonebook[1])
+```
+
+## Dataframes
+
+Data frames are `[row, column]` organized data objects. Rows contain data items (e.g. public health records) and columns contain values of different attributes (e.g. age, address). Values within a column should all have the same type.
+
+R has a built-in `data.frame` type, and and the `tibble` package implements a version of the dataframe that has become very popular for data analysis. This document will use the `tbl_df` dataframe; for more information about the built-in `data.frame` see [here](http://www.r-tutor.com/r-introduction/data-frame). The [`tibble` documentation](https://tibble.tidyverse.org/) outlines the differences between `tbl_df` and `data.frame`.
+
+We will load the `tidyverse` package, which contains the `tibble` package and several other helpful data packages. This will make `tibble` operations available:
+
+```{r}
+library('tidyverse')
+```
+
+We will use one of the built-in example datasets to briefly demonstrate interaction with dataframes. We will load the Motor Trend Car Road Tests, "mtcars" with the `data()` function, convert the row names to a column with the `rownames_to_column()` function, and then convert the dataset to a `tbl_df` with the `tibble()` function:
+
+```{r}
+data("mtcars")
+mtcars <- rownames_to_column(mtcars, var="car_name")
+mtcars <- tibble(mtcars)
+```
+
+The `head()` and `tail()` functions allow you to inspect the first several and last several rows of a dataframe, respectively:
+
+```{r}
+head(mtcars)
+```
+
+```{r}
+tail(mtcars)
+```
+
+The printed display from the `head()` and `tail()` functions indicates the variable type in each column. We see that all the columns contain type `<dbl>`, which is a double precision floating point number.
+
+There is a header row with column names, which we can access using the `names()` function:
+
+```{r}
+names(mtcars)
+```
+
+We can count the number of columns with the `dim()` function, which returns the dimensions in (row, column) order:
+
+```{r}
+dim(mtcars)
+```
+
+Because this is a built-in dataset, we can also inspect help documentation that tells us a bit more about the data:
+
+```{r}
+?mtcars
+```
+
+The "Format" section tells us the column interpretations:
+
+A data frame with 32 observations on 11 (numeric) variables.
+
+    [, 1]	mpg	Miles/(US) gallon
+    [, 2]	cyl	Number of cylinders
+    [, 3]	disp	Displacement (cu.in.)
+    [, 4]	hp	Gross horsepower
+    [, 5]	drat	Rear axle ratio
+    [, 6]	wt	Weight (1000 lbs)
+    [, 7]	qsec	1/4 mile time
+    [, 8]	vs	Engine (0 = V-shaped, 1 = straight)
+    [, 9]	am	Transmission (0 = automatic, 1 = manual)
+    [,10]	gear	Number of forward gears
+    [,11]	carb	Number of carburetors
+
+### Selecting data
+
+You can select data by column with the `$` operator:
+
+```{r}
+mtcars$mpg
+```
+
+#### The %>% operator
+
+The `%>%` operator serves as a pipe, allowing you to build sequences of operations. You can read more about pipe operators [here](https://towardsdatascience.com/an-introduction-to-the-pipe-in-r-823090760d64).
+
+We can use the %>% operator and the `select()` function from the `dplyr` package (which was loaded as part of the `tidyverse` collection of packages) to select multiple columns at the same time:
+
+```{r}
+mtcars %>% dplyr::select(mpg, disp)
+```
+
+### Data summaries
+
+#### Summary statistics
+
+We can calculate the mean and standard deviation of individual columns in the `mtcars` dataset:
+
+```{r}
+print(mean(mtcars$mpg))
+print(sd(mtcars$mpg))
+```
+
+We can also calculate a summary for all the numeric (non-categorical) values in the dataset. The `summary()` function returns the minimum, 25th percentile (1st quartile), median, mean, 75th percentile (3rd quartile), and maximum values. 
+
+```{r}
+numeric_mtcars <- mtcars %>% dplyr::select(car_name, mpg, disp, hp, drat, wt, qsec)
+summary(numeric_mtcars)
+```
+
+#### Summary plots
+
+The `pairs()` function shows generates a scatterplot matrix for all pairwise combinations of columnar variables in a dataset. The diagonal panel indicates the column name and the (x, y) axis coordinate labels. We use the `%>%` operator to drop out the `car_name` column and pass only the truly numeric data to the `pairs()` function.
+
+```{r}
+numeric_mtcars %>% dplyr::select(-car_name) %>% pairs(pch=19)
+```
+
+Histograms provide summaries of the distribution of data. We can use the `ggplot2` library, also part of the `tidyverse`, to generate histograms for the numeric data. Because there are only 32 observations in the `mtcars` dataset, we use only 10 bins in our histogram.
+
+```{r}
+ggplot(data=mtcars, aes(x=mpg)) + geom_histogram(bins=10)
+```
+
+### Reshaping data
+
+Datasets can be broadly categorized as having either "long" or "wide" form. The `mtcars` dataset is "wide" form data: each row is an observation, and each column represents a different measured variable. In contrast, "long" form data includes a single column for "variable type" and many more rows. Wide form data are useful when you need to select single variable types and work with them independently, and for certain types of aggregations. Long form data are useful when you want to do certain types of data joins or merges, and are sometimes required for plotting functions.
+
+The `pivot_longer()` and `pivot_wider()` functions allow you to reshape data as needed.
+
+```{r}
+numeric_mtcars_long <- numeric_mtcars %>% 
+  pivot_longer(!car_name, names_to="variable", values_to="value")
+head(numeric_mtcars_long)
+```
+
+With our long format data, we can easily create a series of histograms with `ggplot`. We use the `scales="free"` argument to allow each panel to have its own x-axis range.
+
+```{r}
+ggplot(data=numeric_mtcars_long, aes(value)) + 
+  geom_histogram(bins=10) + 
+  facet_wrap(~variable, scales="free")
+```

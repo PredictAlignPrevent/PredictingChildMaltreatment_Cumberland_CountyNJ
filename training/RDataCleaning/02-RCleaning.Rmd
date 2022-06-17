@@ -1,0 +1,120 @@
+---
+title: "Cleaning Datasets for Analysis"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '6'
+  html_document:
+    toc: yes
+    theme: united
+    toc_depth: 6
+    toc_float: yes
+---
+
+# A brief explanation of messy data
+
+"Messy data" are data that do not conform to the expected formats required to be read by a machine, or have sensible but inconsistent formats that complicate machine reading. For example, you might recognize "2022-02-03" and "2/3/2022" as two different date formats for February 3, 2022. But a computer program would need explicit instruction on date formats to understand that these two character strings share the same interpretation.
+
+## Reproducible data cleaning workflows
+
+Scripted data cleaning workflows allow you to document how you approach data cleaning in a reproducible and easy-to-share manner. Data cleaning scripts are self-documenting; if you save your R scripts for data cleaning then you have a record of your approach, the decisons you made, and a means of reproducing your cleaning steps. While it may seem easier to clean messy data manually in a spreadsheet application, the reproducibility and transparency benefit of scripted workflows makes the scripted approach the widely preferred method for data analytics.
+
+# Load data from file
+
+|Name|Birthday|
+|:---|:---|
+|Harry Potter|31st July, 1980|
+|Ronald Weasley|1st March, 1980|
+|Hermione Granger|19 September, 1979|
+|Neville Longbottom|30th July, 1980|
+|Ginny Weasley|11th August, 1981|
+|Luna Lovegood|13th February, 1981|
+|Fred and George Weasley|1st April, 1978|
+|James Potter|27th March, 1960|
+|Lily Potter|30th January, 1960|
+|Sirius Black|3rd November, 1959|
+|Remus Lupin|10th March, 1960|
+|Minerva McGonagall|4th October|
+|Rubeus Hagrid|6th December|
+|Severus Snape|9th January, 1960|
+|Voldermort|31st Decmeber|
+
+[source](https://www.quora.com/What-are-the-birthdays-of-Harry-Potter-characters)
+
+## Comma separated values (`.csv`)
+
+```{r}
+hp_csv <- read.csv('data/hp_birthdays.csv')
+hp_csv
+```
+
+**What happened?**
+
+The commas in the dates were interpreted as column separator characters, and the years were put into a new column. 
+
+The first row is presumed to be the header and to contain column names. The column headers were shifted over so that the first column, which should be the "Name" column, now lacks a header.
+
+## Excel spreadsheet (`.xlsx`)
+
+We need the library `readxl` to work directly with Excel spreadsheets.
+
+```{r}
+library(readxl)
+```
+
+Make sure to read in all the tabs of the sheet relevant for your work. The `excel_sheets()` function will return the names of each tab in a vector.
+
+```{r}
+tabs <- excel_sheets('data/hp_birthdays.xlsx')
+tabs
+```
+
+We see that there are two tabs in this sheet: "Birthdays" and "Notes". We can reference these tabs by their positional indexes in the `tabs` variable:
+
+```{r}
+hp_xlsx <- read_excel(path='data/hp_birthdays.xlsx', sheet=tabs[1])
+hp_xlsx
+```
+
+The Excel file loads with the proper column designations because this format does not use commas as a column separator. 
+
+```{r}
+names(hp_xlsx)
+```
+
+The second tab has free-form notes, so we use the `col_names=FALSE` argument to tell the `read_excel()` function not to expect a header row.
+
+```{r}
+hp_notes <- read_excel(path='data/hp_birthdays.xlsx', sheet=tabs[2], col_names=FALSE)
+hp_notes
+```
+
+You might not know if your dataset has multiple tabs or a header row before you attempt to load it into R (this is especially true for very large datasets that open slowly or not at all in spreadsheet applications). It's perfectly fine to load your data, inspect it, and then reload with different arguments as needed.
+
+# Common messes and their fixes
+
+## Missing values
+
+### Interpolate
+
+### Treat as zero
+
+### Ignore
+
+## Inconsistent types
+
+### Detecting type
+
+### Coercing type
+
+## Inconsistent formats
+
+### Detecting type
+
+### Correcting type
+
+## Typos
+
+## Off-by-one errors
+
+## Extra white space

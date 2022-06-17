@@ -1,0 +1,246 @@
+---
+title: 'Exercise: New Jersey Hospital Locations'
+subtitle: "Prepared for PAP New Jersey Trainings"
+date: "February 10, 2022"
+author: Kelly Pierce, Texas Advanced Computing Center
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '6'
+  html_document:
+    toc: yes
+    theme: united
+    toc_depth: 6
+    toc_float: yes
+---
+1. Download "Hospitals in NJ" from the NJGIN Open Data portal: https://njogis-newjersey.opendata.arcgis.com/datasets/hospitals-in-nj/explore?location=40.145600%2C-74.726050%2C8.85&showTable=true
+
+2. Load and inspect the data.
+
+```{r}
+library(sf)
+library(tidyverse)
+WGS84 = 4326
+NJ_PLANAR = 'ESRI:102311'
+hosp <- st_read('data/Hospitals_in_NJ.shp')
+head(hosp)
+```
+
+a. What is the CRS used?
+```{r} 
+st_crs(hosp)
+```
+
+b. How many columns are in the data set?
+```{r}
+names(hosp)
+```
+
+c. How many rows?
+```{r}
+dim(hosp)
+```
+
+d. What are the data types as understood by R? Do those data types match your understanding of the data?
+```{r}
+for(i in seq_along(names(hosp))){
+  print(paste(names(hosp)[i], typeof(hosp[[i]][0]), sep=": "))
+}
+```
+  
+3. Make a faceted histogram of beds by region. Adjust the histogram bin size as necessary.
+
+Upon closer inspection of the data, the `BEDS` column appears to use '9999999" to indicate missing data (it's impossible for a hospital to have almost 10 million beds). This choice was probably made to keep the column data type numeric, but we'll need to address it to make sensible plots. Leaving this high value in the dataset obscures the true distribution of hospital beds:
+
+```{r}
+hosp_hist <- ggplot(data=hosp, aes(x=BEDS)) + 
+  geom_histogram(bins=10) +
+  facet_wrap(~REGION, scales="free")
+hosp_hist
+```
+
+We can replace missing data using the `na_if()` function within a `mutate()` statement:
+
+```{r}
+hosp <- hosp %>% mutate(BEDS = na_if(BEDS, 9999999))
+```
+
+Now that the missing data have been represented as `NA`, we can make more sensible plots. To help with interpretability, we're also going to add a count of the number of hospitals in each region. The pattern `groupby(variable) %>% mutate(N=n())` gives us a count of the values in each grouping. We group by `REGION`, and then create a new column with the region name and sample size together as a string. Faceting with this new column will automatically put the region + sample size information in the title of each facet plot.
+
+```{r}
+hosp <- hosp %>% 
+  group_by(REGION) %>% 
+  mutate(N=n()) %>%
+  mutate(REGION_N=paste(REGION, ", n=", N, sep=''))
+hosp_hist <- ggplot(data=hosp, aes(x=BEDS), label=N) + 
+  geom_histogram(bins=10) +
+  facet_wrap(~REGION_N, scales="free")
+hosp_hist
+```
+
+4. Assign each hospital to a grid cell in the 5-mile grid.
+
+Boilerplate to create 5-mile fishnet grid:
+```{r}
+nj <- read_sf(
+  'https://opendata.arcgis.com/datasets/5f45e1ece6e14ef5866974a7b57d3b95_1.geojson'
+  )
+nj <- nj %>% st_transform(crs=WGS84)
+nj_flat <- st_transform(nj, crs=NJ_PLANAR)
+fishnet_width <- 1609 * 5
+nj_border <- st_make_valid(st_union(nj_flat))
+net <- st_make_grid(
+  x=nj_border, cellsize=fishnet_width, what='polygons', square=TRUE, crs=NJ_PLANAR
+  )
+net_agg <- st_as_sf(net) %>% tibble::rowid_to_column(., "net_id")
+net_intersect <- st_intersects(nj_border, net_agg) 
+fishnet <- net_agg[unique(unlist(net_intersect)),]
+```
+
+Point-in-polygon join and aggregation:
+```{r}
+hosp_net <- st_join(
+  st_transform(hosp, NJ_PLANAR), 
+  fishnet, 
+  join=st_within
+  ) %>%
+    st_drop_geometry() 
+
+hosp_net_summary <- hosp_net %>% 
+  group_by(net_id) %>% 
+  summarise(count=n())
+
+hosp_net_final <- st_as_sf(
+  left_join(
+    fishnet, 
+    hosp_net_summary, 
+    by='net_id'
+    ), 
+  crs=st_crs(fishnet))
+```
+
+a. Plot the corresponding choropleth map of hospitals per grid cell.
+    
+Boilerplate for basemap:
+```{r results='hide', message=FALSE, warning=FALSE}
+library(ggmap)
+nj_bbox <- unname(st_bbox(nj))
+nj_base_map <- get_stamenmap(bbox=nj_bbox, maptype="toner", force=TRUE)
+```
+
+Choropleth map:
+```{r}
+hosp_net_map <- ggmap(nj_base_map) + 
+  geom_sf(
+    data=st_transform(hosp_net_final, crs=WGS84),
+    aes(fill=count),
+    inherit.aes = FALSE, alpha=0.8
+    )
+hosp_net_map
+```
+
+b. Plot a histogram of the hospital per grid cell count.
+
+Most cells do not have any hospitals, and those cells have `NA` in the count colum. The resulting histogram does not reflect the true zeros in the data:
+
+```{r}
+hosp_grid_hist <- ggplot(data=hosp_net_final, aes(x=count)) + 
+  geom_histogram()
+hosp_grid_hist
+```
+
+We can replace the `NA` values with zeros to help visualize the frequency of zero-hospital grid cells in the state:
+
+```{r}
+hosp_net_final$count <- hosp_net_final$count %>% replace_na(0)
+```
+
+The new histogram gives more information on the zeros in the dataset:
+
+```{r}
+hosp_grid_hist_zeros <- ggplot(data=hosp_net_final, aes(x=count)) + 
+  geom_histogram(bins=10)
+hosp_grid_hist_zeros
+```
+    
+5. Make a county-level fishnet.
+
+a. Use the `filter()` method to subset a single county's data from the hospital dataset.
+
+```{r}
+hosp_cumberland <- hosp %>% filter(COUNTY == 'CUMBERLAND')
+```
+
+b. Make a new fishnet grid for that county only, this time with half-mile resolution.
+
+Fishnet boilerplate: 
+
+```{r}
+fishnet_half_mi_width <- 1609 * (1/2)
+cumberland_border <- nj %>% 
+  filter(COUNTY=='CUMBERLAND') %>%
+  st_transform(crs=NJ_PLANAR)
+half_mi_net <- st_make_grid(
+  x=cumberland_border, 
+  cellsize=fishnet_half_mi_width, 
+  what='polygons', 
+  square=TRUE, 
+  crs=NJ_PLANAR
+  )
+net_agg_half_mi <- st_as_sf(half_mi_net) %>% tibble::rowid_to_column(., "net_id")
+net_intersect_half_mi <- st_intersects(cumberland_border, net_agg_half_mi) 
+fishnet_half_mi <- net_agg_half_mi[unique(unlist(net_intersect_half_mi)),]
+```
+
+(We've seen the fishnet boilerplate repeated a couple of times. In practice you would want to wrap this code in a helper function to ease reuse.)
+
+c. Aggregate that county's hospital data into the half-mile fishnet grid.
+
+Point-in-polygon join and aggregation:
+```{r}
+cumberland_hosp_net <- st_join(
+  st_transform(hosp_cumberland, NJ_PLANAR), 
+  fishnet_half_mi, 
+  join=st_within
+  ) %>%
+    st_drop_geometry() 
+
+cumberland_hosp_net_summary <- cumberland_hosp_net %>% 
+  group_by(net_id) %>% 
+  summarise(count=n())
+
+cumberland_hosp_net_final <- st_as_sf(
+  left_join(
+    fishnet_half_mi, 
+    cumberland_hosp_net_summary, 
+    by='net_id'
+    ), 
+  crs=st_crs(fishnet_half_mi))
+```
+b. Make the corresponding choropleth map and histogram for this county only.
+
+We extracted the Cumberland County border above and transformed it to the `NJ_PLANAR` CRS. However, to get the corresponding basemap, we need to provide bounding box coordinates in the `WGS84` CRS.
+
+```{r}
+cumberland_bbox <- unname(st_bbox(st_transform(cumberland_border, WGS84)))
+cumberland_base_map <- get_stamenmap(bbox=cumberland_bbox, maptype="toner", force=TRUE)
+```
+
+The choropleth map is a bit easier to read if we leave the zero counts as `NA` to avoid darkly shading the cells:
+```{r}
+cumberland_net_map <- ggmap(cumberland_base_map) + 
+  geom_sf(
+    data=st_transform(cumberland_hosp_net_final, crs=WGS84),
+    aes(fill=count),
+    inherit.aes = FALSE, alpha=0.8
+    )
+cumberland_net_map
+```
+
+In contrast, the histogram is a bit more interpretable with the zeros represented:
+```{r}
+cumberland_hosp_net_final$count <- cumberland_hosp_net_final$count %>% replace_na(0)
+cumberland_grid_hist_zeros <- ggplot(data=cumberland_hosp_net_final, aes(x=count)) + 
+  geom_histogram(bins=10)
+cumberland_grid_hist_zeros
+```

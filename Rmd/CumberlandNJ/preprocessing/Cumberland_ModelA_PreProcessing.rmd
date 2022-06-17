@@ -1,0 +1,652 @@
+---
+title: "Model A, Cumberland County, NJ Data Processing Workflow"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '6'
+  html_document:
+    toc: yes
+    theme: united
+    toc_depth: 6
+    toc_float: yes
+---
+
+```{r clean, include=FALSE}
+# a clean slate each time
+rm(list=ls())
+```
+
+```{r setup, eval=TRUE, include=FALSE, warning=FALSE, messages=FALSE, echo=TRUE, tidy=TRUE, cache=TRUE}
+# default to suppress all code chunks unless explicitly indicated
+knitr::opts_chunk$set(include=TRUE, warning=FALSE, error=FALSE, tidy=TRUE, results='hide',
+                      message=FALSE, echo=FALSE, cache=TRUE, fig.align="center")
+```
+
+# Model A Description
+
+Model A (Typical PAP model) - To include all CWS and CPS referrals, which would capture all calls, including those with a finding (4 tiers), as well as those without a finding. The unit of analysis is referral per child, which would require allegations to be aggregated when there are multiple allegations per child per referral.
+
+# Environment setup
+
+The data processing workflow is informed by the [spatialML_package](https://github.com/urbanSpatial/spatialML_package) produced by [UrbanSpatial](http://urbanspatialanalysis.com/) and customized for the State of New Jersey Division of Youth and Family Services.
+
+This work relies on several R packages, imported below:
+
+```{r load-pkgs, warning=FALSE, error=FALSE, tidy=TRUE, results='hide', message=FALSE}
+                      
+library("sf")            # Spatial data objects and methods
+library("ggmap")         # ggplot2 addon for base maps
+library("cowplot")
+library("raster")        # cell-based spatial operations
+library("tidyverse")     # data manipulation framework
+library("knitr")         # for kable table
+library("viridis")
+library("viridisLite")
+library("tidycensus")
+library("tigris")
+library("lubridate")
+library("readr")
+library("units")
+```
+
+We have defined custom several helper functions in `fishnet.r` and `map_themes.r` to assist with data processing and visualization. Load these functions into the environment with the `source()` function.
+
+```{r load-custom-fxns, include=TRUE, echo=TRUE, warning=FALSE, error=FALSE, tidy=TRUE, results='hide', message=FALSE}
+source('~/predict-align-prevent/R/sourcefiles/fishnet.r')
+source('~/predict-align-prevent/R/sourcefiles/map_themes.r')
+```
+
+# Data processing
+
+## Geocoding
+
+Summary of how geocoding is done using https://github.com/kellypierce/geocode-tools
+
+## Coordinate reference systems
+
+We use three coordinate reference systems (CRS):
+
+- WGS84 is used for map visualizations.
+- NAD83 is used by US Census Bureau geocoder, which provided a number of the latitude/longitude coordinates for this analysis.
+- The New Jersey State Planar coordinate reference system is used for euclidean distance calculations that would otherwise be distorted if attempted on an ellipsoid projection such as WGS84.
+
+
+```{r geometry-constants, include=TRUE, echo=TRUE}
+WGS84 = 4326
+NAD83 = 4269
+NJ_PLANAR = 'ESRI:102311'
+```
+
+We also load some generic information about Cumberland County, our area of interest. The `load_neighborhood()` method loads a shapefile of New Jersey counties from the [New Jersey Open Data Portal](https://opendata.arcgis.com/datasets/5f45e1ece6e14ef5866974a7b57d3b95_1.geojson) and converts the CRS to the WGS84 CRS for compatibility with Landscan data. This function also accepts arguments to load data from different areas and can convert to a different CRS if desired.
+
+We use the `extract_area()` method to select Cumberland County from the New Jersey county shapefile, and then use `collect_basemap()` to download a basemap of Cumberland County to use in map visualizations.
+
+```{r neighborhoods-basemaps, include=TRUE, echo=TRUE}
+# load and prep general purpose data
+nj <- load_neighborhood(
+  url='https://opendata.arcgis.com/datasets/5f45e1ece6e14ef5866974a7b57d3b95_1.geojson', 
+  crs=NJ_PLANAR)
+cumberland <- extract_area(nj)
+cumberland_bm <- collect_basemap(cumberland, crs=WGS84)
+```
+
+## Maltreatment data
+
+### Load data and aggregate
+
+Each row in the `geocoded_incidents` dataframe is a single allegation. There may be multiple allegations per child, multiple allegations per call to NJ DCF, and multiple children with multiple allegations per child.
+
+The data do not have a unique child identifier, so we instead assume that children can be uniquely identified by their age and address. Of course, there will be some exceptions to this rule for which we cannot directly account. We aggregate on child age and address to collapse these multiple-allegation referrals into a single referral.
+
+We consider referrals made on different dates to be distinct child referrals, so one child may be represented multiple times in the final dataset if referrals are made on different days.
+
+```{r load-incidents, include=TRUE, echo=TRUE}
+# incidents data
+geocoded_incidents <- read.csv('~/PredictAlign/171819_NJ_geocoded_incidents.csv')
+geocoded_incidents$intake_year <- lubridate::year(geocoded_incidents$Intake.RcvdDate)
+```
+
+Aggregation to child-referrals is performed here. New Jersey state FIPS code is 34; Cumberland County FIPS code is 11.
+
+```{r agg-referrals, include=TRUE, echo=TRUE}
+child_referrals <- geocoded_incidents %>% 
+  filter(state_fips==34 & county_fips==11 & match_indicator=='Match') %>%
+  group_by(intake_year, Intake.RcvdDate, Intake.ChildAge, full_addr, 
+           lat, lon, state_fips, county_fips) %>% 
+  summarise(incident_count=n())
+
+referrals_shp <- create_incidents_sf(
+  child_referrals, 
+  initial_crs=NAD83, 
+  transform_crs=NJ_PLANAR)
+```
+
+Summarize the total number of incidents, and use this value to sanity-check further data manipluations:
+
+```{r incident_count, include=TRUE, echo=TRUE}
+total_incidents <- child_referrals %>% group_by(intake_year) %>% summarise(total=sum(incident_count))
+check_shp <- referrals_shp %>% group_by(intake_year) %>% summarise(total=sum(incident_count))
+
+print(total_incidents)
+print(check_shp)
+```
+
+## Create maltreatment and population fishnets
+
+We want to subdivide Cumberland County into grid cells of equal area, and then describe both the raw count of maltreatment events and the incidence of maltreatment per 100 people in each grid cell. 
+
+We use two grids. The first is a 0.5 mi wide x 0.5 mi tall grid populated population with data from the American Community Survey census block group population estimates for Cumberland County in 2017, 2018 and 2019. These population data allow us to calculate maltreatment incidence per 100 people. The second grid is a 30-arcsecond grid with population data from the Landscan ambient population estimate. We calculate the average of day and night population estimates provided by the Department of Homeland Security (https://hifld-geoplatform.opendata.arcgis.com/datasets/e431a6410145450aa56606568345765b/about).
+
+### Half-mile fishnet grid
+
+```{r inc-fishnets, eval=TRUE, include=TRUE, echo=TRUE, cache=TRUE, warning=FALSE, error=FALSE, tidy=TRUE, results='hide', message=FALSE}
+
+# years in referral, risk, and protective data (incidents only span 2017-2019)
+years <- 2017:2019
+resolutions <- c(0.5)
+referral_fishnets_list = list() # for storing referral fishnets
+annual_fishnets_list = list() # for storing population fishnets
+for(i in seq_along(years)){
+  # filter referrals by year
+  year_referrals <- referrals_shp %>% filter(intake_year==years[i])
+  year_pop <- collect_population(
+    key_path='~/CooksProTX/us_census_api_key.txt', 
+    year=years[i], 
+    crs=NJ_PLANAR
+    )
+  for(j in seq_along(resolutions)){  # population fishnet
+    pop_net <- create_population_fishnet(
+      pop_data=year_pop, 
+      cover_area=cumberland, 
+      fishnet_size=resolutions[j], 
+      fishnet_units='mi'
+      )
+    year_res <- paste(years[i], resolutions[j], sep='_')
+    annual_fishnets_list[[year_res]] <- pop_net
+    referral_fishnets_list[[year_res]] <- create_incidents_fishnet(
+      pop_fishnet=pop_net, 
+      incidents_data=year_referrals
+      )
+  }
+}
+```
+
+### Landscan 30 arcsecond (approx 1km) grid
+
+Landscan data cannot be reprojected in their original raster format. However, we have previously converted the landscan raster to a shapefile with the following procedure:
+
+- raster data are converted to points such that each population cell is associated with a single (lat, lon) coordinate
+- the (lat, lon) coordinates for each point are taken to be centroids of non-overlapping squares with 30 arcsecond (0.00833 decimal degree) sides
+- the four points defining the square polygon (xmin, xmax, ymin and ymax) are calculated as (lon-0.00833, lon+0.00833, lat-0.00833, lat+0.00833).
+
+The Landscan shapefile can then be safely reprojected in the NJ State Planar projection without resampling of population data.
+
+```{r nj-landscan, include=TRUE}
+landscan <- st_read('~/predict-align-prevent/landscan/NJ_1km_grid_2019/NJ_1km_grid_2019.shp') %>%
+  st_transform(NJ_PLANAR)
+```
+
+We extract Cumberland County from state data with a left spatial join and then drop the unnecessary columns added by the join.
+
+```{r subset-cumberland, include=TRUE, warning=FALSE, error=FALSE, tidy=TRUE, results='hide', message=FALSE}
+
+landscan_cumberland <- st_intersection(cumberland, landscan) %>% 
+  dplyr::select('geometry', 'population')
+
+referrals2019 <- referrals_shp %>% filter(intake_year==2019)
+# get population for 2019
+pop2019 <- collect_population(
+  key_path='~/CooksProTX/us_census_api_key.txt', 
+  year=2019, 
+  crs=NJ_PLANAR
+  )
+
+# add "net_id", "unitless_net_pop" and "net_pop" columns
+landscan_cumberland$net_id <- seq.int(nrow(landscan_cumberland))
+landscan_cumberland$unitless_net_pop <- landscan_cumberland$population
+landscan_cumberland$net_pop <- landscan_cumberland$population
+units(landscan_cumberland$net_pop) <- units(referral_fishnets_list[[1]]$net_pop)
+referrals_landscan <- create_incidents_fishnet(
+  pop_fishnet=landscan_cumberland, 
+  incidents_data=referrals2019
+  )
+
+# add the landscan fishnets to the lists
+annual_fishnets_list[['2019_landscan']] <- landscan_cumberland
+referral_fishnets_list[['2019_landscan']] <- referrals_landscan
+```
+
+```{r check-fn-counts, eval=TRUE, include=TRUE, echo=TRUE}
+print(check_shp)
+print(sum(referral_fishnets_list[['2017_0.5']]$incident_count))
+print(sum(referral_fishnets_list[['2018_0.5']]$incident_count))
+print(sum(referral_fishnets_list[['2019_0.5']]$incident_count))
+print(sum(referral_fishnets_list[['2019_landscan']]$incident_count))
+```
+
+```{r sanity-check-map, eval=FALSE, include=FALSE, echo=FALSE}
+sanity_map_landscan <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(
+      referrals_landscan,
+      crs=WGS84
+      ), aes(fill=incident_count), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 14, family = "sans"),
+    legend.text = element_text(size = 9, family = "sans")) +
+  labs(title='Referral count, Landscan 1km grid')
+
+sanity_map_landscan
+```
+
+### Subset to areas of interest
+
+Our analysis will focus on four municipal areas: Bridgeton, Commercial Township, Millville and Vineland.
+
+```{r urban-rural-categories, include=TRUE, echo=TRUE, warning=FALSE, error=FALSE, tidy=TRUE, results='hide', message=FALSE}
+
+# load urban areas shapefile
+municipalities <- st_read(
+  '~/PredictAlign/Municipal_Boundaries_of_NJ/Municipal_Boundaries_of_NJ.shp'
+  )
+municipality_names <- c("Commercial Township", "Bridgeton", "Millville", "Vineland")
+cumberland_cities <- municipalities %>% 
+  filter(NAME %in% municipality_names) %>% 
+  st_transform(crs=crs(referral_fishnets_list[[1]]))
+
+# only need geometry from one of the fishnets at each resolution
+fishnet_half_mi <- annual_fishnets_list[[1]] %>% 
+  dplyr::select(net_id, geometry)
+landscan_geometry <- annual_fishnets_list[['2019_landscan']] %>%
+  dplyr::select(net_id, geometry)
+
+# all areas to include, half mile grid
+fishnet_half_mi_intersect <- st_intersects(
+  cumberland_cities, fishnet_half_mi
+  )
+fishnet_half_mi_cover_area <- fishnet_half_mi[
+  unique(unlist(fishnet_half_mi_intersect)),
+  ]
+fishnet_half_mi <- fishnet_half_mi %>% 
+  mutate(include_area = if_else(
+    (net_id %in% fishnet_half_mi_cover_area$net_id), 'include', 'exclude'
+  ))
+
+# all areas to include, landscan grid
+landscan_intersect <- st_intersects(
+  cumberland_cities, landscan_geometry
+  )
+landscan_cover_area <- landscan_geometry[
+  unique(unlist(landscan_intersect)),
+  ]
+landscan_geometry <- landscan_geometry %>% 
+  mutate(include_area = if_else(
+    (net_id %in% landscan_cover_area$net_id), 'include', 'exclude'
+  ))
+
+test <- ggmap(cumberland_bm) +
+  geom_sf(data=st_transform(fishnet_half_mi, crs=WGS84),
+          aes(fill=include_area),
+          inherit.aes = FALSE)
+
+test_ls <- ggmap(cumberland_bm) +
+  geom_sf(data=st_transform(landscan_geometry, crs=WGS84),
+          aes(fill=include_area),
+          inherit.aes = FALSE)
+
+# intersect individual urban areas with fishnet
+for(k in seq_along(municipality_names)){
+  urban_area <- cumberland_cities %>% 
+    filter(NAME==municipality_names[k])
+  ## HALF MILE FISHNET
+  net_intersect_05 <- st_intersects(urban_area, fishnet_half_mi)
+  net_cover_area_05 <- fishnet_half_mi[unique(unlist(net_intersect_05)),]
+  colname <- paste('in', municipality_names[k], sep='_')
+  fishnet_half_mi <- fishnet_half_mi %>%
+    mutate({{colname}} := if_else(
+      (net_id %in% net_cover_area_05$net_id), TRUE, FALSE))
+  ## LANDSCAN FISHNET
+  net_intersect_ls <- st_intersects(urban_area, landscan_geometry)
+  net_cover_area_ls <- landscan_geometry[unique(unlist(net_intersect_ls)),]
+  landscan_geometry <- landscan_geometry %>%
+    mutate({{colname}} := if_else(
+      (net_id %in% net_cover_area_ls$net_id), TRUE, FALSE
+    ))
+}
+
+fishnet_half_mi$fn_width <- '0.5'
+landscan_geometry$fn_width <- 'landscan'
+urban_rural_fishnets <- bind_rows(fishnet_half_mi, landscan_geometry) %>% 
+  st_drop_geometry()
+
+test_bt <- ggmap(cumberland_bm) +
+  geom_sf(data=st_transform(landscan_geometry, crs=WGS84),
+          aes(fill=in_Bridgeton),
+          inherit.aes = FALSE)
+
+test_ct <- ggmap(cumberland_bm) +
+  geom_sf(data=st_transform(landscan_geometry, crs=WGS84),
+          aes(fill=`in_Commercial Township`),
+          inherit.aes = FALSE)
+
+test_mv <- ggmap(cumberland_bm) +
+  geom_sf(data=st_transform(landscan_geometry, crs=WGS84),
+          aes(fill=in_Millville),
+          inherit.aes = FALSE)
+
+test_vl <- ggmap(cumberland_bm) +
+  geom_sf(data=st_transform(landscan_geometry, crs=WGS84),
+          aes(fill=in_Vineland),
+          inherit.aes = FALSE)
+
+# overlap between millville and neighboring municipality rasters
+# use include/exclude column for "in study area" and use the
+# in_{municipality} column for filtering the data
+# if we used the polygons themselves, we'd get inappropriate per capita rates
+overlap_mv_ct <- landscan_geometry %>% filter(
+  in_Millville == TRUE & `in_Commercial Township` == TRUE)
+overlap_mv_vl <- landscan_geometry %>% filter(
+  in_Millville == TRUE & in_Vineland == TRUE
+)
+
+for(l in seq_along(annual_fishnets_list)){
+  indicators <- unlist(strsplit(names(annual_fishnets_list)[l], split='_'))
+  annual_fishnets_list[[l]]$intake_year <- indicators[1]
+  annual_fishnets_list[[l]]$fn_width <- indicators[2]
+}
+
+# landscan data has a "population" column we do not need (redundant with "net_pop")
+all_generic_fishnets <- bind_rows(annual_fishnets_list) %>%
+  select(-population)
+all_generic_fishnets_urban_rural <- left_join(
+  all_generic_fishnets, urban_rural_fishnets, by=c('fn_width', 'net_id')
+  )
+all_generic_fishnets_urban_rural <- st_as_sf(
+  all_generic_fishnets_urban_rural, coords='geometry'
+  )
+all_generic_fishnets_urban_rural_save <- all_generic_fishnets_urban_rural %>%
+  select(-unitless_net_pop) %>%
+  rename('in_Commercial_Township' = `in_Commercial Township`)
+```
+
+```{r write-generic-fishnet, include=FALSE, eval=TRUE}
+
+st_write(
+  all_generic_fishnets_urban_rural_save,
+  '~/PredictAlign/PredictAlignFishnets/cumberland_fishnets_urban_areas_with_landscan_NJ_PLANAR.shp',
+  delete_layer=TRUE)
+
+```
+
+We can now map the urban and rural areas on the fishnets.
+
+```{r sanity-urban-rural}
+urban_map <- ggmap(cumberland_bm) + 
+  geom_sf(data=st_transform(all_generic_fishnets_urban_rural, crs=WGS84), aes(fill=include_area), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  facet_grid(intake_year ~ fn_width) +
+  geom_sf(data=st_transform(cumberland_cities,crs=WGS84), aes(size=0.75), color='black', inherit.aes=FALSE, alpha=0) +
+  scale_size_identity()
+  
+urban_map
+```
+
+Now that we have defined fishnet grids and their year-to-year populations, we can combine these grids with the maltreatment data.
+
+```{r combine-fishnets, include=TRUE, echo=TRUE, warning=FALSE, error=FALSE, tidy=TRUE, results='hide', message=FALSE}
+half_mi_inc_names <- names(referral_fishnets_list)[grepl('_0.5', names(referral_fishnets_list))]
+landscan_inc_names <- names(referral_fishnets_list)[grepl('_landscan', names(referral_fishnets_list))]
+
+fn05mi <- fishnet_half_mi %>% 
+  st_drop_geometry %>% 
+  rename('in_Commercial_Township' = `in_Commercial Township`) %>%
+  dplyr::select(
+    net_id, include_area, in_Bridgeton, in_Commercial_Township, 
+    in_Millville, in_Bridgeton, in_Vineland
+    ) 
+fnlandscan <- landscan_geometry %>% 
+  st_drop_geometry %>% 
+  rename('in_Commercial_Township' = `in_Commercial Township`) %>%
+  dplyr::select(
+    net_id, include_area, in_Bridgeton, in_Commercial_Township, 
+    in_Millville, in_Bridgeton, in_Vineland
+    ) 
+
+for(i in seq_along(half_mi_inc_names)){
+  # referrals
+  data <- referral_fishnets_list[[half_mi_inc_names[i]]]
+  data <- left_join(data, fn05mi, by='net_id')
+  referral_fishnets_list[[half_mi_inc_names[i]]] <- data
+}
+
+for(i in seq_along(landscan_inc_names)){
+  # referrals
+  data <- referral_fishnets_list[[landscan_inc_names[i]]]
+  data <- left_join(data, fnlandscan, by='net_id')
+  referral_fishnets_list[[landscan_inc_names[i]]] <- data
+}
+
+```
+
+```{r next-sanity}
+print(check_shp)
+print(sum(referral_fishnets_list[['2017_0.5']]$incident_count))
+print(sum(referral_fishnets_list[['2018_0.5']]$incident_count))
+print(sum(referral_fishnets_list[['2019_0.5']]$incident_count))
+print(sum(referral_fishnets_list[['2019_landscan']]$incident_count))
+for(i in seq_along(referral_fishnets_list)){
+  print(names(referral_fishnets_list[[i]]))
+}
+```
+
+## Maltreatment risk categories
+
+Next we assign risk categories for each year and fishnet grid resolution combination. Most grid cells, regardless of the spatial resolution, contain no incidents of child maltreatment. We exclude these zeros when calculating risk categories so that our risk assessment focuses on areas where maltreatment is reported rather that the large area where it either does not occur or is not reported. **We will also exclude all areas outside of Bridgeton, Commercial Township, Millville, and Vineland, as requested by DCF.**
+
+```{r risk-categories, include=TRUE, echo=TRUE, warning=FALSE, error=FALSE, tidy=TRUE, results='hide', message=FALSE}
+# get risk categories
+get_risk_categories <- function(dataset, column){
+  # define 4 quantiles that map to 5 risk categories, excluding zero counts
+  quantiles <- stats::quantile(dataset[[column]], probs=c(0.3, 0.5, 0.7, 0.9))
+  new_name <- paste(column, 'risk_category', sep='_')
+  dataset[[new_name]] <- sapply(dataset[[column]], assign_risk_cat, quantiles)
+  dataset[[new_name]] <- factor(dataset[[new_name]], levels=c(1, 2, 3, 4, 5))
+  return(dataset)
+}
+
+# referrals
+referral_risk_list <- list()
+for(d in seq_along(referral_fishnets_list)){
+  element_name <- names(referral_fishnets_list)[[d]]
+  fishnet_only <- referral_fishnets_list[[d]] %>% 
+    select(-incident_count, -inc_per_100, -include_area) 
+  include <- referral_fishnets_list[[d]] %>% 
+    select(net_id, incident_count, inc_per_100, include_area) %>% 
+    st_drop_geometry() %>% 
+    filter(
+      incident_count > 0 & incident_count != Inf & include_area != 'exclude'
+      )
+  exclude <- referral_fishnets_list[[d]] %>% 
+    select(net_id, incident_count, inc_per_100, include_area) %>% 
+    st_drop_geometry() %>%
+    filter(
+      include_area == 'exclude' | incident_count == 0 & incident_count == Inf)
+  rc <- get_risk_categories(include, column='incident_count')
+  rc <- get_risk_categories(rc, column='inc_per_100')
+  rc_total <- bind_rows(rc, exclude)
+  rc_net <- left_join(fishnet_only, rc_total, by='net_id')
+  referral_risk_list[[element_name]] <- rc_net
+}
+
+```
+
+```{r next-sanity2}
+print(check_shp)
+print(sum(referral_risk_list[['2017_0.5']]$incident_count, na.rm=TRUE))
+print(sum(referral_risk_list[['2018_0.5']]$incident_count, na.rm=TRUE))
+print(sum(referral_risk_list[['2019_0.5']]$incident_count, na.rm=TRUE))
+print(sum(referral_risk_list[['2019_landscan']]$incident_count, na.rm=TRUE))
+```
+
+### Finalize maltreatment data
+
+At this point we have described the annual population, maltreatment count, maltreatment incidence, and percentile-based maltreatment risk for Cumberland County. We save these data in two ways: first as a shapefile that contains the grid cell geometries, and second as a comma-separated file that contains the grid cell centroids.
+
+```{r finalize, include=TRUE, echo=TRUE, warning=FALSE, error=FALSE, tidy=TRUE, results='hide', message=FALSE}
+for(l in seq_along(referral_risk_list)){
+  indicators <- unlist(strsplit(names(referral_risk_list)[l], split='_'))
+  referral_risk_list[[l]]$intake_year <- indicators[1]
+  referral_risk_list[[l]]$fn_width <- indicators[2]
+}
+
+all <- bind_rows(referral_risk_list) 
+all_final <- all %>% dplyr::select(-unitless_net_pop, -population)
+names(all_final) <- c(
+  'net_id', 'net_pop', 'geometry', 'overlaps_Bridgeton', 
+  'overlaps_Commercial_Township',
+  'overlaps_Millville', 'overlaps_Vineland', 'count', 'count100', 'area', 
+  'count_risk', 'inc_risk', 'year',
+  'fn_width')
+
+print(all_final %>% group_by(area) %>% summarise(total_count = sum(count)))
+
+all_centroids <- all_final %>% 
+  st_centroid() %>%
+  mutate(
+    fishnet_centroid_lon=sf::st_coordinates(.)[,1],
+    fishnet_centroid_lat=sf::st_coordinates(.)[,2]) %>%
+  st_drop_geometry()
+```
+
+```{r sanity3}
+print(check_shp)
+print(all_final %>% group_by(year, fn_width) %>% summarise(total=sum(count, na.rm=TRUE)))
+
+print(dim(all_final %>% filter(year=='2017' & fn_width=='0.5')))
+print(dim(all_final %>% filter(year=='2018' & fn_width=='0.5')))
+print(dim(all_final %>% filter(year=='2019' & fn_width=='0.5')))
+# there are 2150 cells in the final half mile fishnet
+
+print(dim(all_final %>% filter(year=='2019' & fn_width=='landscan')))
+# there are 2107 cell in the 30 arcsecond landscan grid
+
+# cells with one or more incident per year
+print(all_final %>% group_by(year, fn_width) %>% filter(!is.na(count)) %>% summarise(sum=n()))
+```
+
+```{r write-agg, eval=TRUE, include=FALSE}
+
+st_write(all_final, '~/PredictAlign/PredictAlignFishnets/cumberland_fishnets_urban_areas_and_maltreatment_aggregations_with_landscan_modelA_NJ_PLANAR.shp', delete_layer=TRUE)
+
+write.csv(all_centroids, '~/PredictAlign/PredictAlignFishnets/cumberland_fishnets_urban_areas_and_maltreatment_aggregations_with_landscan_modelA_NJ_PLANAR.csv')
+```
+
+#### Maltreatment, half-mile grid
+
+```{r halfmi-maltrt, include=TRUE, echo=TRUE, out.width='2000px'}
+half_mi_raw_map <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(
+      filter(all_final, fn_width=='0.5'), 
+      crs=WGS84
+      ), aes(fill=count_risk), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  facet_grid(~ year) +
+  scale_fill_viridis_d(
+    na.value = NA,
+    option = "D",
+    direction = 1,
+    name = ""
+  ) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 14, family = "sans"),
+    legend.text = element_text(size = 9, family = "sans")) +
+  labs(title='Risk count, 1/2mi grid')
+
+half_mi_inc_map <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(
+      filter(all_final, fn_width=='0.5'), 
+      crs=WGS84
+      ), aes(fill=inc_risk), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  facet_grid(~ year) +
+  scale_fill_viridis_d(
+    na.value = NA,
+    option = "D",
+    direction = 1,
+    name = ""
+  ) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 14, family = "sans"),
+    legend.text = element_text(size = 9, family = "sans")) +
+  labs(title='Risk by count per 100, 1/2mi grid')
+
+cowplot::plot_grid(half_mi_raw_map, half_mi_inc_map, nrow=2)
+```
+
+#### Maltreatment, landscan grid
+
+```{r landscan-maltrt, include=TRUE, echo=TRUE, out.width='2000px'}
+landscan_raw_map <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(
+      filter(all_final, fn_width=='landscan'), 
+      crs=WGS84
+      ), aes(fill=count_risk), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  facet_grid(~ year) +
+  scale_fill_viridis_d(
+    na.value = NA,
+    option = "D",
+    direction = 1,
+    name = ""
+  ) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 14, family = "sans"),
+    legend.text = element_text(size = 9, family = "sans")) +
+  labs(title='Risk count, Landscan 30 arcsecond grid')
+
+landscan_inc_map <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(
+      filter(all_final, fn_width=='landscan'), 
+      crs=WGS84
+      ), aes(fill=inc_risk), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  facet_grid(~ year) +
+  scale_fill_viridis_d(
+    na.value = NA,
+    option = "D",
+    direction = 1,
+    name = ""
+  ) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 14, family = "sans"),
+    legend.text = element_text(size = 9, family = "sans")) +
+  labs(title='Risk by count per 100, Landscan 30 arcsecond grid')
+
+cowplot::plot_grid(landscan_raw_map, landscan_inc_map, ncol=2)
+```
+
+

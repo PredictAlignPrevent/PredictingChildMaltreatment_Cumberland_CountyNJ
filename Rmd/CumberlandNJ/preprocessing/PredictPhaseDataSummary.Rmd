@@ -1,0 +1,301 @@
+---
+title: "Cumberland County New Jersey Predict Phase Data Summary"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '6'
+  html_document:
+    toc: yes
+    theme: united
+    toc_depth: 6
+    toc_float: yes
+---
+
+```{r clean, include=FALSE}
+# a clean slate each time
+rm(list=ls())
+```
+
+```{r setup, include=FALSE, eval=TRUE, warning=FALSE, messages=FALSE, echo=FALSE, cache=FALSE}
+# default to suppress all code chunks unless explicitly indicated
+knitr::opts_chunk$set(include=TRUE, warning=FALSE, error=FALSE, results='hide',
+                      message=FALSE, echo=FALSE, cache=TRUE, fig.align="center")
+library("sf")            # Spatial data objects and methods
+library("ggmap")         # ggplot2 addon for base maps
+library("cowplot")
+library("raster")        # cell-based spatial operations
+library("tidyverse")     # data manipulation framework
+library("knitr")         # for kable table
+library("viridis")
+library("viridisLite")
+library("tidycensus")
+library("tigris")
+library("lubridate")
+library("readr")
+library("units")
+```
+
+```{r geometry-constants}
+WGS84 = 4326
+NAD83 = 4269
+NJ_PLANAR = 'ESRI:102311'
+```
+
+```{r load-custom-fxns}
+source('~/predict-align-prevent/R/sourcefiles/fishnet.r', local = knitr::knit_global())
+source('~/predict-align-prevent/R/sourcefiles/map_themes.r', local = knitr::knit_global())
+```
+
+```{r neighborhoods-basemaps}
+# load and prep general purpose data
+nj <- load_neighborhood(
+  url='https://opendata.arcgis.com/datasets/5f45e1ece6e14ef5866974a7b57d3b95_1.geojson', 
+  crs=NJ_PLANAR
+  )
+cumberland <- extract_area(nj)
+cumberland_bm <- collect_basemap(cumberland, crs=WGS84)
+```
+
+```{r load-data}
+# Child welfare
+modelA <- st_read(
+  '~/PredictAlign/PredictAlignFishnets/cumberland_fishnets_urban_areas_and_maltreatment_aggregations_with_landscan_modelA_NJ_PLANAR.shp'
+  )
+modelB <- st_read(
+  '~/PredictAlign/PredictAlignFishnets/cumberland_fishnets_urban_areas_and_maltreatment_aggregations_with_landscan_modelB_NJ_PLANAR.shp'
+  )
+
+# Risk/protective data -- agregated and binned include/exclude
+risk_protect_total <- st_read(
+  '~/PredictAlign/PredictAlignFishnets/all_risk_protect_summary_by_datasource_city_landscan_20220329_NJ_PLANAR.shp'
+  )
+risk_protect_half_mi_total <- st_read(
+  '~/PredictAlign/PredictAlignFishnets/all_risk_protect_summary_by_datasource_city_half_mile_20220329_NJ_PLANAR.shp'
+  )
+
+area_summary_05 <- ggmap(cumberland_bm) +
+  geom_sf(
+    data=st_transform(risk_protect_half_mi_total, crs=WGS84), 
+    aes(fill=n), inherit.aes=FALSE) +
+  facet_wrap(~source, ncol=3) +
+  scale_fill_viridis_c(option="E")
+```
+
+```{r model-maps-tables}
+fishnet <- st_read(
+  '~/PredictAlign/PredictAlignFishnets/cumberland_fishnets_urban_areas_with_landscan_NJ_PLANAR.shp'
+  ) 
+# fix names shortened by ESRI shapefile driver
+names(fishnet) <- c('net_id', 'net_pop',
+                    'year', 'fn_width', 'include_area', 
+                    'in_Commercial_Township', 'in_Bridgeton',
+                    'in_Millville', 'in_Vineland',
+                    'geometry')
+
+municipalities <- st_read(
+  '~/PredictAlign/Municipal_Boundaries_of_NJ/Municipal_Boundaries_of_NJ.shp'
+  )
+municipality_names <- c("Commercial Township", "Bridgeton", "Millville", "Vineland")
+cumberland_cities <- municipalities %>% 
+  filter(NAME %in% municipality_names) %>% 
+  st_transform(crs=crs(fishnet))
+
+fishnet_half_mile <- fishnet %>% 
+  filter(fn_width=='0.5') %>% distinct()
+fishnet_landscan <- fishnet %>% 
+  filter(fn_width=='landscan') %>% 
+  distinct()
+
+modelA_excl <- modelA %>% 
+  filter(area == 'exclude') %>% 
+  mutate(count = ifelse((count == 0), NA, count))
+
+modelA_incl <- modelA %>% 
+  filter(area != 'exclude' & fn_wdth==0.5) %>% 
+  mutate(count = ifelse(is.na(count), 0, count)) %>%
+  st_drop_geometry() %>%
+  full_join(fishnet_half_mile, on='net_id') %>%
+  st_as_sf(crs=crs(fishnet_half_mile))
+
+modelA_fmt <- bind_rows(modelA_excl, modelA_incl)
+
+half_mi_raw_mapA <- ggmap(cumberland_bm) +
+  geom_sf(
+    data=st_transform(modelA_incl, crs=WGS84),
+    aes(fill=count), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  facet_grid(~ year) +
+  scale_fill_viridis_c(option="E") + mapTheme() + theme(
+    plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 14, family = "sans"),
+    legend.text = element_text(size = 9, family = "sans")) +
+  labs(title='Model A Referral Count, 1/2mi grid')
+
+modelB_incl <- modelB %>% 
+  filter(area != 'exclude' & fn_wdth==0.5) %>% 
+  mutate(count = ifelse(is.na(count), 0, count)) %>%
+  st_drop_geometry() %>%
+  full_join(fishnet_half_mile, on='net_id') %>%
+  st_as_sf(crs=crs(fishnet_half_mile))
+
+half_mi_raw_mapB <- ggmap(cumberland_bm) +
+  geom_sf(
+    data=st_transform(modelB_incl, crs=WGS84),
+    aes(fill=count), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  facet_grid(~ year) +
+  scale_fill_viridis_c(option="E") + mapTheme() + theme(
+    plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 14, family = "sans"),
+    legend.text = element_text(size = 9, family = "sans")) +
+  labs(title='Model B Established/Substantiated Referral Count, 1/2mi grid')
+
+modelA_table <- modelA %>% 
+  st_drop_geometry() %>% 
+  group_by(area) %>% 
+  summarise(n=sum(count)) %>% 
+  drop_na()
+
+modelB_table <- modelB %>% 
+  st_drop_geometry() %>% 
+  group_by(area) %>% 
+  summarise(n=sum(count)) %>% 
+  drop_na()
+```
+# Overview
+
+We present summaries of the data used for the Predict phase of the Predict-Align-Prevent method. We have organized datasets by type (child welfare or risk and protective factors). We have further highlighted which data points fall within the desired study area of Bridgeton, Commercial Township, Millville and Vineland. Observations falling outside those areas are noted as "Excluded" in summary tables.
+
+\newpage
+# Child welfare data
+
+## Model A
+
+Model A (Typical PAP model) - To include all CWS and CPS referrals, which would capture all calls, including those with a finding (4 tiers), as well as those without a finding. The unit of analysis is referral per child, which would require allegations to be aggregated when there are multiple allegations per child per referral.
+
+We retain the following welfare referrals (calls) in model A:
+```{r modelA-table, results='markup'}
+kable(modelA_table, caption="Child welfare referrals for model A")
+```
+
+The referrals are mapped to half-mile grid cells to show the spatial distribution of child welfare referrals. . Gray cells represent cells with no observations. For brevity, only the half-mile grid is shown.
+
+```{r modelA-map}
+half_mi_raw_mapA
+```
+
+## Model B
+
+Model B - To include CPS data with an established or substantiated finding. The unit of analysis is referral per child, which would require allegations to be aggregated when there are multiple allegations per child per referral.
+
+We retain the following established/substantiated referrals (calls) in model B:
+```{r modelB-table, results='markup'}
+kable(modelB_table, caption="Child welfare referrals for model B")
+```
+
+The established/substantiated referrals are mapped to half-mile grid cells to show the spatial distribution of child welfare referrals. Gray cells represent cells with no observations. For brevity, only the half-mile grid is shown.
+```{r modelB-map}
+half_mi_raw_mapB
+```
+
+# Risk and Protective Factors (crime, violation, and business location location data)
+
+## Aggregated data summary
+
+Data are filtered to only the municipal boundaries of Bridgeton, Commercial Township, Millville, and Vineland, New Jersey. 
+
+In the figure below, we show the total count of all crime, violation, and business location data available outside ("Exclude") and inside ("Include") the target study area (summed across years 2017-2019). Gray cells represent cells with no observations. For brevity, only the half-mile grid is shown.
+
+```{r crp-map}
+area_summary_05
+```
+\newpage
+The counts of data inside to include in analysis are reported in the table below:
+
+```{r full_table, results='markup', cache=TRUE}
+all_risk_protect <- bind_rows(risk_protect_half_mi_total,
+                              risk_protect_total)
+full_summary_wide <- all_risk_protect %>%
+  group_by(source, fn_wdth, year) %>%
+  st_drop_geometry() %>% 
+  summarise(n=sum(n)) %>%
+  drop_na() %>%
+  pivot_wider(id_cols = c('year', 'fn_wdth'), names_from='source', values_from='n') %>%
+  rename('fishnet width*'=fn_wdth) %>% rename('Millville Crime'=`Cumberland-Millville`) %>%
+  rename('Vineland Crime'=Vineland)
+kable(full_summary_wide, caption="Total risk and protective data.")
+```
+
+\*Fishnet width "0.5" indicates the half-mile fishnet grid; resolution "landscan" indicates the 30 arcsecond fishet grid. Landscan data are only available for 2019, so only 2019 crime data are aggregated on the landscan grid.\*\*Year "none" indicates data for which no year is available. These data are exclusively business location data, which were not provided temporal information.
+
+\newpage
+## Data counts by source
+
+We filtered data to the boundaries of the municipality originating the data. In the case of State Police data and risk/protective factor data, we retained records from any of the four municipalities of interest (Bridgeton, Commercial Township, Millville and Vineland).
+
+### Bridgeton Crime
+
+We are able to keep the following observations from the Bridgeton crime dataset:
+```{r bt_table, results='markup', cache=TRUE}
+bt_summary <- read.csv('~/PredictAlign/final_bridgeton_crime_count_summary.csv') %>% select(-X)
+kable(bt_summary, caption="Bridgeton crime data.")
+```
+\newpage
+### Millville Violations
+
+#### Code enforcement
+
+We are able to keep the following observations from the Millville code inforcement dataset:
+```{r mv_table, results='markup', cache=TRUE}
+mv_summary <- read.csv('~/PredictAlign/final_millville_violation_count_summary.csv') %>% select(-X)
+kable(mv_summary, caption="Millville code enforcement data.")
+```
+
+#### Rental inspections
+
+We are able to keep the following observations from the Millville failed rental inspections dataset:
+```{r mv_rent_table, results='markup', cache=TRUE}
+mv_rent_summary <- read.csv('~/PredictAlign/final_millville_rental_inspection_failures_count_summary.csv') %>% select(-X)
+kable(mv_rent_summary, caption="Millville failed rental inspection.")
+```
+
+### Bridgeton Violoations
+
+We are able to keep the following observations from the Bridgeton violation dataset:
+```{r btv_table, results='markup', cache=TRUE}
+btv_summary <- read.csv('~/PredictAlign/final_bridgeton_violations_inspection_failures_count_summary.csv') %>% select(-X)
+kable(btv_summary, caption="Bridgeton violation data.")
+```
+\newpage
+### Risk and protective feature locations
+
+These data were obtained from Infogroup (now Data Axle).
+
+We are able to keep the following observations from the risk and protective features (business locations) dataset:
+```{r crp_table, results='markup', cache=TRUE}
+crp_summary <- read.csv('~/PredictAlign/final_risk_protective_count_summary.csv') %>% select(-X)
+kable(crp_summary, caption="Risk and protective factor data.")
+```
+\newpage
+### State Police, Millville, and Vineland Crime
+
+The State Police crime data are organized by different data sources: "State Police", "Cumberland-Millville", and "Vineland". Each data source was processed separately, and the summary statistics combined into the table below.
+
+Records from data source "State Police" were provided with latitude and longitude coordinates.
+
+We are able to keep the following observations from the State Police, Millville, and Vineland crime datasets:
+
+```{r sp_table, results='markup', cache=TRUE}
+library(stringr)
+stpol_summary <- read.csv('~/PredictAlign/final_st_pol_mv_vl_crime_count_summary.csv') %>% select(-X)
+names(stpol_summary) <- str_replace_all(
+  string=names(stpol_summary),
+  pattern='\\.',
+  replacement=' '
+)
+kable(stpol_summary, caption="State Police, Millville and Vineland crime data.")
+```

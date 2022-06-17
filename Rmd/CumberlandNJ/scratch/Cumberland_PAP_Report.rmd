@@ -1,0 +1,459 @@
+---
+title: "Fishnet creation demo, 3mi"
+theme: united
+---
+  
+```{r setup, include=FALSE, warning=FALSE, messages=FALSE, echo=FALSE, cache=FALSE}
+knitr::opts_chunk$set(include=FALSE, warning=FALSE, 
+                      message=FALSE, echo=FALSE, cache=FALSE, fig.align="center")
+```
+
+```{r packages, message=FALSE, warning=FALSE, cache=FALSE, echo=FALSE}
+library("sf")            # Spatial data objects and methods
+library("mapview")       # Interactive Map Viewing
+library("ggmap")         # ggplot2 addon for base maps
+library("cowplot")
+library("spatstat")      # KDE and other spatial functions
+library("raster")        # cell-based spatial operations
+library("tidyverse")     # data manipulation framework
+library("Hmisc")         # using cut2() functions for ggplot legends
+library("hrbrthemes")
+library("gridExtra")
+library("knitr")         # for kable table
+library("viridis")
+library("viridisLite")
+library("readxl")
+library("spdep")
+library("tidycensus")
+library("tigris")
+```
+
+
+```{r themes}
+mapTheme <- function() {
+  theme(
+    plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.text = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.ticks = element_blank(),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 10, family = "sans"),
+    legend.text = element_text(size = 9, family = "sans"),
+    panel.border = element_blank()
+  )
+}
+
+plotTheme <- function() {
+  theme(
+    plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0), 
+    axis.title.x = element_text(size = 10, family = "sans", face = "plain", hjust = 1, vjust = -0.5),
+    axis.title.y = element_text(size = 10, family = "sans", face = "plain", hjust = 1, vjust = 1),
+    axis.text = element_text(size = 9, family = "sans", face = "plain"),
+    panel.background = element_blank(),
+    panel.grid.minor = element_line(colour = "gray"),
+    panel.grid.major = element_line(colour = "gray"),
+    axis.ticks = element_blank(),
+    legend.title = element_text(size = 10, family = "sans"),
+    legend.text = element_text(size = 9, family = "sans"),
+    axis.line = element_blank()
+  )
+}
+```
+
+```{r options}
+# options from original Richmond VA analysis, mostly not used
+mapviewOptions(basemaps = c("Stamen.TonerLite", "OpenStreetMap.DE"))
+k_direction = 8 # 4 = rook, 8 = queen
+k_nearest_neighbors = 5
+# Either k (e.g. 5 or 10) or "LOOCV"
+n_folds = "LOOCV"
+# threshold quntile for statArea grouping
+stat_area_quantile = 0.60
+# Number of simulations for CPS vs. NN
+simulations = 1000
+# Number of neighbors for CPS vs. NN
+k = 5
+# random seed
+set.seed(717)
+```
+
+```{r load-local-data, eval=FALSE}
+########################
+## WELFARE DATA       ##
+########################
+
+# this code is run once and the output saved; no need to run again
+
+# /mnt is the directory mount in the Singularity container used to run
+# this file on Frontera
+setwd('/mnt')
+excel_sheets('NJ-Data/state_data/17-tacc.xlsx')
+excel_sheets('NJ-Data/state_data/18-tacc.xlsx')
+excel_sheets('NJ-Data/state_data/19-tacc.xlsx')
+
+nj17 <- read_excel('NJ-Data/state_data/17-tacc.xlsx', guess_max=70000)
+nj18 <- read_excel('NJ-Data/state_data/18-tacc.xlsx', guess_max=70000)
+nj19 <- read_excel('NJ-Data/state_data/19-tacc.xlsx', guess_max=70000)
+
+all_nj <- rbind(nj17, nj18, nj19)
+
+geocoded <- read.csv('NJ-Data/state_data/unique_geocoded_addresses/geocoded_addresses_unique_welfare_addr_17_18_19_all.csv')
+
+incident_addr <- geocoded %>% filter(Addr_Type=='Incident_Address')
+
+geocoded_incidents = left_join(
+  all_nj, incident_addr,
+  by=c(
+    "Intake-Incident-Address1"="Address",
+    "Intake-Incident-Address2"="Addr2",
+    "Intake-Incident-City"="City",
+    "Intake-Incident-St"="State")
+)
+
+geocoded_incidents <- geocoded_incidents %>% distinct()
+write.csv(geocoded_incidents, '/mnt/predict-align/171819_NJ_geocoded_incidents.csv')
+```
+
+```{r neighborhoods}
+# The geojson contains the vector data for all counties in New Jersey
+nj_crs <- 'ESRI:102311'
+nbr <- read_sf("https://opendata.arcgis.com/datasets/5f45e1ece6e14ef5866974a7b57d3b95_1.geojson") %>% 
+  st_sf() %>%
+  st_transform(nj_crs)
+
+nbr_crs <- crs(nbr) # keep track of default coord ref system
+
+# get cumberland shape by filtering on county name
+# this replaces the dissolve() operation because there are not internal boundaries
+# to dissolve (this is the county outline only)
+cumberland <- nbr %>% filter(COUNTY=='CUMBERLAND')
+
+# this object is not subsequently used for the map creation, but I'm leaving
+# it here in case some aspect of downstream analysis requires it
+cumberland_rast_SP <- raster(as(cumberland, "Spatial"), nrows = 2000, ncol = 2000)
+```
+
+
+```{r basemap, cache=TRUE}
+# the original Richmond, VA analysis defines the bounding box as the polygon that
+# contains all the maltreatment points. here we use an alternative strategy and use
+# the bounding box defined by the county outline
+cumberland_bbox <- unname(st_bbox(st_transform(cumberland, crs = 4326)))
+
+cps_base_map <- get_stamenmap(bbox = cumberland_bbox, maptype = "toner", force=TRUE)
+plot(cps_base_map)
+```
+
+```{r local-read}
+# assuming your working directory contains this file...
+geocoded_incidents <- read.csv('~/PredictAlign/171819_NJ_geocoded_incidents.csv')
+# sanity check; this maps includes more than just cumberland county because the basemap
+# is defined by the bounding box containing Cumberland County, and the geocoded_incidents
+# data set contains both Cumberland and Camden County data
+sanity1 <- ggmap(cps_base_map) + geom_point(data=geocoded_incidents, aes(x=lon, y=lat), color='red')
+```
+
+```{r fishnet}
+# See https://github.com/r-spatial/sf/issues/1505 for discussion on "cellsize" documentation
+# Tl;dr: cellsize is the width of the square or hexagon used in the grid, in the units of measure for the map
+# if the data are projected in decimal degrees, fishnet_grid_dim must be in decimal degrees (where one decimal degree is
+# approximately 111km; see https://www.usna.edu/Users/oceano/pguth/md_help/html/approx_equivalents.htm). 
+# If the data are projected in meters, then fishnet_grid_dim must be in meters.
+
+# Verify units of the underlying map:
+st_crs(cumberland)$proj4string
+
+mi_to_m <- function(mi){return(mi*1609)}
+
+fishnet_grid_dim = mi_to_m(3)
+net <- st_make_grid(
+  x=cumberland,
+  #cellsize = fishnet_grid_dim,
+  n=c(50,50),
+  what='polygons',
+  square=TRUE
+)
+
+check_grid <- ggmap(cps_base_map) + geom_sf(data=st_transform(net, crs = 4326), inherit.aes = FALSE)
+
+# convert the fishnet raster into a sf polygon dataset and add a "net_id" column
+net_agg <- st_as_sf(net) %>% tibble::rowid_to_column(., "net_id")
+
+# list of net cells IDs that intersect with Cumberland
+net_intersect <- st_intersects(cumberland, net_agg) 
+
+# extract Cumberland net cells based on intersect ID
+net_Cumberland <- net_agg[unique(unlist(net_intersect)),]
+net_hood <- st_join(net_Cumberland, nbr, largest = TRUE)
+listw <- nb2listw(poly2nb(as(net_Cumberland, "Spatial"), queen = TRUE))
+```
+
+```{r population_data, cache=TRUE}
+# replace with your own API key or key file
+key <- read.table(
+  '~/CooksProTX/us_census_api_key.txt', header=TRUE, colClasses='character'
+)
+census_api_key(key)
+
+# use the American Community Survey (ACS) to get the population for Cumberland
+# county by block group. the default year is 2019 (most recent available
+# at run time).
+nbr1 <- get_acs(
+  geography='block group',
+  variables='B01003_001',
+  state='NJ',
+  county='Cumberland County',
+  year=2019,
+  survey='acs5',
+  show_call=TRUE,
+  geometry=TRUE
+) %>% st_transform(crs=nbr_crs)
+
+# sanity check map
+sanity2 <- ggmap(cps_base_map) + geom_sf(data=st_transform(nbr1, crs = 4326), aes(fill=estimate), inherit.aes = FALSE)
+```
+
+```{r areas}
+nbr1$block_area <- st_area(nbr1$geometry)
+nbr1$pop_rate = nbr1$estimate/nbr1$block_area # the population data are in column "estimate"
+
+net_Cumberland$net_area <- st_area(net_Cumberland$x)
+
+approx_width <- sqrt(net_Cumberland$net_area[1])
+```
+
+```{r t_intersection}
+# intersect the census block groups with the fishnet for Cumberland County
+# the goal here is to assign a population to the fishnet cells based on the population
+# reported by the census at the block group level. the core assumption here is that
+# population is uniformly distributed across each block group, and areal weighted
+# interpolation can be used to assign fishnet grid cells an underlying population.
+
+net_blocks_intersect <- st_intersection(nbr1, net_Cumberland)
+
+# group by fishnet cell and calc block stats.
+net_blocks_intersect <- net_blocks_intersect %>%
+  # calculate the area of each tract/fishet intersection
+  mutate(
+    intersect_area = st_area(net_blocks_intersect)
+  ) %>%
+  # group by the fishnet ID
+  group_by(net_id) %>%
+  # calculate the fraction of each block group covered by a fishnet cell
+  # then assume the population is proportional to the overlap area
+  mutate(cnt = n(),
+         pcnt_of_block = intersect_area/block_area,
+         intersect_pop = estimate * pcnt_of_block) %>%
+  arrange(net_id)
+
+# confirm that 100% of each Census Block Group is covered by fishnet cells
+area_check <- net_blocks_intersect %>%
+  group_by(GEOID) %>%
+  summarise(pct_covered = sum(pcnt_of_block))
+min(area_check$pct_covered)
+max(area_check$pct_covered)
+```
+
+```{r summarise_pop}
+# estimate the population in each fishnet cell based on the census
+# data and the size of the fishnet cell
+fishnet_pop <- net_blocks_intersect %>%
+  group_by(net_id) %>%
+  summarise(net_pop = sum(intersect_pop)) 
+
+# sanity check on fishnet populations
+fishnet_pop$unitless_net_pop <- units::drop_units(fishnet_pop$net_pop)
+
+######### MAKE NET AND RATE FOR ALL CPS VARS
+census_crs <- 'EPSG:4269'
+incidents_shp <- geocoded_incidents %>% drop_na(lat, lon) %>%
+  mutate(incident_count=1) %>% # each row is a single incident
+  st_as_sf(.,coords=c("lon","lat"), crs=census_crs) %>%
+  st_transform(nj_crs)
+
+# left arg = points, right arg = polygons
+# this retains each incident observation and geometry, 
+# but loses the fishnet pop geometry. to correct this,
+# drop the incident_net geometry and then do a second
+# non-spatial join of the fishnet_pop dataframe on
+# the net_id column
+
+incidents_net <- st_join(incidents_shp, fishnet_pop, join=st_within) %>%
+  st_drop_geometry() 
+
+# double checking that the CRS is the same for each
+crs(fishnet_pop)
+crs(incidents_shp)
+
+# calculate the final number of incidents in each fishnet cell
+incidents_grp_net_pt1 <- incidents_net %>% 
+  drop_na(net_id) %>%
+  dplyr::select(net_id, incident_count) %>%
+  group_by(net_id) %>% 
+  summarise(incident_count = sum(incident_count))
+
+# add back the fishnet polygon geometry
+incidents_grp_net <- st_as_sf(
+  left_join(fishnet_pop, incidents_grp_net_pt1, by='net_id'), 
+  crs=nbr_crs
+)
+
+# replace NA with 0
+incidents_grp_net$incident_count <- replace_na(incidents_grp_net$incident_count, 0)
+
+# sanity check with default color palette
+sanity4 <- ggmap(cps_base_map) +
+  geom_sf(
+    data = st_transform(incidents_grp_net, crs = 4326), 
+    aes(fill = incident_count), 
+    inherit.aes = FALSE, color = NA, alpha = 0.8
+  )
+
+# calculate incidents per 100
+incidents_grp_net$inc_per_100 <- units::drop_units((incidents_grp_net$incident_count/incidents_grp_net$net_pop)*100)
+
+# another sanity check with the default palette
+sanity5 <- ggmap(cps_base_map) +
+  geom_sf(
+    data = st_transform(incidents_grp_net, crs = 4326), 
+    aes(fill = inc_per_100), 
+    inherit.aes = FALSE, color = NA, alpha = 0.8
+  )
+```
+
+```{r bin_counts}
+# the original Richmond report used discretised bins for reporting raw counts
+# and maltreatment incidence. below is a revision of that code with explicit
+# ordering of interval bins as factors to enforce the desired color palette
+
+fix_bins <- function(bin){
+  listified_bin <- as.numeric(unlist(str_extract_all(as.character(bin), "\\d+\\.*\\d*")))
+  return(listified_bin[1])
+}
+
+incidents_grp_net <- incidents_grp_net %>% 
+  mutate(count_bins = cut_interval(incident_count, n = 5, ordered_result=TRUE)) %>%
+  mutate(incidence_bins = cut_interval(inc_per_100, n = 10, ordered_result=TRUE))
+
+# split intervals into numbers, extract the lower bound, and then convert back 
+# to character (but keep separate columns -- numeric for sorting, and discrete for
+# plotting...)
+
+incidents_grp_net$count_bins <- sapply(
+  incidents_grp_net$count_bins, fix_bins
+)
+incidents_grp_net$count_bins_discrete <- as.character(
+  incidents_grp_net$count_bins, fix_bins
+)
+
+incidents_grp_net$incidence_bins <- sapply(
+  incidents_grp_net$incidence_bins, fix_bins
+)
+incidents_grp_net$incidence_bins_discrete <- as.character(
+  incidents_grp_net$incidence_bins, fix_bins
+)
+
+
+incidents_grp_net$incidence_bins_discrete <- factor(
+  incidents_grp_net$incidence_bins_discrete,
+  levels = sort(unique(incidents_grp_net$incidence_bins))
+)
+incidents_grp_net <- incidents_grp_net %>% arrange(incidence_bins_discrete)
+
+theme_void()
+CPS_RATE_BY_FISHNET_PLOT = ggmap(cps_base_map) +
+  geom_sf(
+    data = st_transform(incidents_grp_net, crs = 4326), 
+    aes(fill = incidence_bins_discrete), 
+    inherit.aes = FALSE, color = NA, alpha = 0.8
+  ) +
+  scale_fill_viridis_d(
+    na.value = NA,
+    option = "D",
+    direction = 1,
+    name = "CPS Count per 100"
+  ) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 10, family = "sans"),
+    legend.text = element_text(size = 9, family = "sans"))
+
+incidents_grp_net$count_bins_discrete <- factor(
+  incidents_grp_net$count_bins_discrete,
+  levels = sort(unique(incidents_grp_net$count_bins))
+)
+incidents_grp_net <- incidents_grp_net %>% arrange(count_bins_discrete)
+
+theme_void() # clear theme to work around "polygon edge not found" error
+CPSCOUNT_by_nbr_plot = ggmap(cps_base_map) +
+  geom_sf(
+    data = st_transform(incidents_grp_net, crs = 4326), 
+    aes(fill = count_bins_discrete), 
+    inherit.aes = FALSE, color = NA, alpha = 0.8
+  ) + 
+  scale_fill_viridis_d(
+    na.value = NA,
+    option = "D",
+    direction = 1,
+    name = "CPS Count"
+  ) + 
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 10, family = "sans"),
+    legend.text = element_text(size = 9, family = "sans"))
+
+```
+
+# Sanity check figures
+
+```{r original_fishnet}
+sanity3 <- ggmap(cps_base_map) +
+  geom_sf(
+    data = st_transform(fishnet_pop, crs = 4326), 
+    aes(fill = unitless_net_pop), 
+    inherit.aes = FALSE, color = NA, alpha = 0.8
+  ) +
+  labs(title = 'population from `fishnet_pop`')
+```
+
+```{r compare_aggregates}
+fn_1 <- fishnet_pop %>% select(net_id, unitless_net_pop)
+inc_1 <- incidents_grp_net %>% select(net_id, unitless_net_pop)
+fn_inc <- left_join(fishnet_pop, as_tibble(incidents_grp_net), by='net_id')
+fn_inc$diff <- fn_inc$net_pop.x - fn_inc$net_pop.y
+max(fn_inc$diff)
+min(fn_inc$diff)
+```
+
+```{r cache = FALSE, echo=FALSE, warning=FALSE, include = TRUE, fig.width=11.5, fig.height=5}
+cowplot::plot_grid(sanity1, sanity2, sanity3, sanity4, sanity5, nrow=2, align = "hv", axis = "lrbt")
+```
+
+```{r cache = FALSE, echo=FALSE, warning=FALSE, include = TRUE, fig.width=11.5, fig.height=5}
+merged_fishnet <- ggmap(cps_base_map) + 
+  geom_sf(
+    data=st_transform(incidents_grp_net, crs = 4326),
+    aes(fill=unitless_net_pop), 
+    inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  labs(title = 'population from `incidents_grp_net`')
+cowplot::plot_grid(sanity3, merged_fishnet, nrow=1, align='hv', axis='lrbt')
+```
+
+# Count and incidence, all maltreatment types
+
+```{r cache = FALSE,echo=FALSE, warning=FALSE, include = TRUE, fig.width=11.5, fig.height=5}
+cowplot::plot_grid(CPSCOUNT_by_nbr_plot, CPS_RATE_BY_FISHNET_PLOT, align = "hv", axis = "lrbt")
+```

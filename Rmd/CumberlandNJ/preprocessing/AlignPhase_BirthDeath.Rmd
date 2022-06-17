@@ -1,0 +1,384 @@
+---
+title: "Align Phase, Cumberland County, NJ Data Processing Workflow"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '6'
+  html_document:
+    toc: yes
+    theme: united
+    toc_depth: 6
+    toc_float: yes
+---
+
+```{r clean, include=FALSE}
+# a clean slate each time
+rm(list=ls())
+```
+
+```{r setup, include=TRUE, eval=TRUE, warning=FALSE, messages=FALSE, echo=FALSE, cache=FALSE}
+# default to suppress all code chunks unless explicitly indicated
+knitr::opts_chunk$set(include=TRUE, warning=FALSE, error=FALSE, results='hide',
+                      message=FALSE, echo=FALSE, cache=TRUE, fig.align="center")
+```
+
+```{r}
+library(tidyverse)
+library(haven)
+library(readxl)
+library(readr)
+library(lubridate)
+library(knitr)
+```
+
+# Mortality Data
+
+Required:
+- Maternal mortality
+- Infant mortality
+- Injury-related fatalities
+- Fatalities associated with toxic stress
+
+## 2017
+
+Approximately 2k records missing latitude/longitude data.
+
+```{r}
+mortality17 <- read_sas('~/Downloads/NJ DCF PAP Project_5-3-2022/NJDOH Mortality Data amf_2017_nossn.sas7bdat')
+has_coords17 <- mortality17 %>% 
+  filter(amfResidenceLatitude != "" & amfResidenceLongitude != "")
+dim(has_coords17)
+dim(mortality17)
+
+min(mortality17$amfResidenceLatitude)
+max(mortality17$amfResidenceLatitude)
+
+mortality17$year <- lubridate::year(mortality17$amfDateDeath)
+```
+
+## 2018
+
+Had to change encoding of ~/Downloads/NJ DCF PAP Project_5-3-2022/NJ DOH Mortality Data_2018.csv to UTF-8 to read file
+
+Approximately 4k records missing latitude/longidute data.
+
+```{r}
+mortality18 <- read.csv('~/Downloads/NJ DCF PAP Project_5-3-2022/NJ DOH Mortality Data_2018.csv')
+has_coords18 <- mortality18 %>% filter(!is.na(X35..LATITUDE.OF.RESIDENCE) &
+                                         !is.na(X36..LONGITUDE.OF.RESIDENCE))
+dim(has_coords18)
+dim(mortality18)
+```
+
+Convert the column names so we can bind with other data
+
+```{r}
+mortality18_column_decode <- read_excel('~/Downloads/NJ DCF PAP Project_5-3-2022/NJ DOH Mortality Codebook.xlsx')
+
+mortality18_column_decode$fix_names <- sapply(mortality18_column_decode$Label, make.names)
+
+name_map <- as.list(setNames(mortality18_column_decode$`Variable Name`, mortality18_column_decode$fix_names))
+
+lookup <- function(key){
+  if(key %in% names(name_map)){
+    return(unname(name_map[[key]]))
+  }else{
+    return(key)
+  }
+}
+
+current_names <- names(mortality18)
+repair_names <- sapply(current_names, gsub, pattern='í', replacement='.')
+
+fix_names <- sapply(repair_names, lookup)
+names(mortality18) <- fix_names
+```
+
+Parse death date and add year
+
+```{r}
+mortality18$amfDateDeath <- lubridate::parse_date_time(
+  mortality18$amfDateDeath,
+  orders=c('mdy')
+  )
+
+mortality18$year <- lubridate::year(mortality18$amfDateDeath)
+```
+
+## 2019
+
+Approximately 3.5k records missing latidute/longidude data.
+
+```{r}
+mortality19 <- read_sas('~/Downloads/NJ DCF PAP Project_5-3-2022/NJDOH Mortality Data amf_2019exp.sas7bdat')
+has_coords19 <- mortality19 %>% 
+  filter(amfResidenceLatitude != "" & amfResidenceLongitude != "")
+dim(has_coords19)
+dim(mortality19)
+mortality19$year <- lubridate::year(mortality19$amfDateDeath)
+```
+
+## Combine all years
+
+```{r}
+mortality17<-mortality17 %>% 
+  mutate(across(everything(), as.character))
+mortality18<-mortality18 %>% 
+  mutate(across(everything(), as.character))
+mortality19<-mortality19 %>% 
+  mutate(across(everything(), as.character))
+mortality <- bind_rows(mortality17, mortality18, mortality19)
+
+mortality_cumberland <- mortality %>% 
+  filter(amfStateResidence == 'NJ' | amfResidenceStateCountry == "NEW JERSEY") %>%
+  filter(amfCountyResidence %in% c('11', NA))
+
+mortality_cumberland %>% filter(amfCountyResidence %in% c('11', NA)) %>% group_by(amfCountyResidence) %>% summarise(n=n())
+```
+
+
+```{r}
+mortality_to_geocode <- mortality_cumberland %>% 
+  filter(amfResidenceLatitude == "" & amfResidenceLongitude == "") %>%
+  select(c("amfExpStateOccurrence", "amfPopSizeCountyOccurrence","amfMunicipalityOccurrence","amfStateResidence",
+           "amfCountryResidence","amfStateCountryResidenceRecode","amfCountyResidence","amfCityResidence",
+           "amfPopSizeCityResidence","amfMetroCountyResidence","amfExpStateResidence","amfPMSAResidence",
+           "amfPopSizeCountyResidence","amfPMSAPopSizeResidence","amfCMSAResidence","amfResidenceAddress",
+           "amfResidenceCity","amfResidenceStateCountry","amfResidenceZipCode","amfResidenceExpandedZipCode"  ,
+           "amfResidenceCountyCode","amfResidenceMunicipalCode","amfResidenceMunicipalityName",
+           "amfResidenceLatitude","amfResidenceLongitude")) %>% distinct()
+```
+
+Summary stats
+
+```{r}
+sufficient_inf <- mortality_to_geocode %>%
+  filter(amfResidenceAddress != '') %>% 
+  filter(amfResidenceCity != '') %>%
+  filter(amfResidenceZipCode != '') %>%
+  filter(amfResidenceZipCode != '')
+
+total_obs <- dim(mortality)[1]
+total_obs_cumberland <- dim(mortality_cumberland)[1]
+total_distinct_obs_cumberland_to_geocode <- dim(mortality_to_geocode)[1]
+total_with_sufficient_info <- dim(sufficient_inf)[1]
+
+summary_data <- tibble(
+  source=c('morality'),
+  total_observations=total_obs,
+  total_in_Cumberland=total_obs_cumberland,
+  total_in_Cumberland_distinct=total_distinct_obs_cumberland_to_geocode,
+  total_in_Cumberland_with_sufficient_inf=total_with_sufficient_info
+)
+```
+
+```{r}
+mortality_to_geocode %>% group_by(amfStateResidence) %>% summarise(n=n())
+mortality_to_geocode %>% group_by(amfResidenceStateCountry) %>% summarise(n=n())
+mortality_to_geocode %>% group_by(amfCountyResidence) %>% summarise(n=n())
+
+write.csv(mortality_to_geocode, '~/PredictAlign/align-data/NJDOH_Mortality_Data_2017_2018_2019_to_geocode.csv')
+write.csv(mortality_cumberland, '~/PredictAlign/align-data/NJDOH_Mortality_Data_2017_2018_2019_CumberlandCounty.csv')
+```
+
+# Birth data
+
+Birth data are fixed-width files. There are 760 columns. We don't need them all. We need categories that map to:
+
+Required:
+- Maternal mortality
+- Infant mortality: "Discharge Status" (3=expired)
+
+Requested:
+- Premature birth: 
+  - (Birth Weight) Pounds
+  - (Birth Weight) Ounces
+  - (Birth Weight) Grams
+- Very low birth weight: filter on above
+- Maternal morbidity: several factors listed, all Y/N.
+- Teen birth: filter on column "Mother's Age"
+- Drug exposed new borns
+  - Alcohol in month before mother knew of pregnancy 1=any, 2=none
+  - Any drug (eg. marijuana, cocaine, opioids) in month before pregnancy known 5=no use (!=5 indicates use of some number of days per week)
+  - Exposure after pregnancy was known is left blank by NJ DOH
+- No prenatal care at birth: "Did mother receive prenatal care?" Y=yes, N=no
+  
+
+```{r}
+col_widths <- read_excel('~/Downloads/NJ DCF PAP Project_5-3-2022/NJ DOH Birth File Layout.xlsx')
+
+keep_col_names <- c(
+  'vipMothersAge',
+  'vipMMMaternalTransfusion',
+  'vipMMThirdFourthDegree',
+  'vipMMRupturedUterus',
+  'vipMMUnplannedHyst',
+  'vipMMAdmissionToICU',
+  'vipMMUnplannedOperatingRoom',
+  'vipMMNone',
+  'vipMMUnknown',
+  'vipWeightinPounds',
+  'vipWeightinOunces',
+  'vipWeightinGrams',
+  'vipDischargeStatus',
+  'vipDrinks1MonthBeforePreg',
+  'vipSmokes1MonthBeforePreg',
+  'vipDrinksDaysWk1MonthBeforePreg',
+  'vipDrugsDaysWk1MonthBeforePreg',
+  'vipMotherReceivePrenatalCare',
+  'vipMothersResStateAbbr',
+  'vipMothersResCountyName',
+  'vipMothersResTownName',
+  'vipMothersResStreetNumber',
+  'vipMothersResStreetName',
+  'vipMothersResStreetTypeDesc',
+  'vipMothersResAptNbr',
+  'vipMothersResZip',
+  'vipMothersResZipExt',
+  'vipGeoMothersResState1',
+  'vipGeoMothersResMunicipality',
+  'vipGeoMothersResStreet',
+  'vipGeoMothersResCity',
+  'vipGeoMothersResState',
+  'vipGeoMothersResZip',
+  'vipGeoMothersResCountyName',
+  'vipGeoMothersResMCDFips',
+  'vipGeoMothersResMunicipalityName',
+  'vipGeoMothersResLatitude',
+  'vipGeoMothersResLongitude',
+  'vipGeoMothersResTract',
+  'vipGeoMothersResBlock',
+  'vipGeoMatchScore',
+  'vipGeoMatchStatus'
+  )
+
+keep_cols <- col_widths %>% filter(VARIABLE_NAME %in% keep_col_names)
+```
+
+## 2017
+
+```{r}
+birth17 <- readr::read_fwf(
+  '~/Downloads/NJ DCF PAP Project_5-3-2022/NJ DOH Birth Data_2017.txt',
+  fwf_positions(start=keep_cols$START, end=keep_cols$END, col_names=keep_cols$VARIABLE_NAME))
+```
+
+```{r}
+bad_rows_17 <- problems()
+```
+
+```{r}
+cumberland17 <- birth17 %>% filter(vipMothersResCountyName %in% c('CUMBERLAND', NA) & vipMothersResTownName %in% c('MILLVILLE', 'VINELAND', 'COMMERCIAL TOWNSHIP', 'BRIDGETON') & vipMothersResStateAbbr == 'NJ')
+
+missing_county <- cumberland17 %>% filter(is.na(vipMothersResCountyName))
+wrong_county <- cumberland17 %>% filter(!is.na(vipMothersResCountyName) & vipMothersResCountyName != 'CUMBERLAND')
+
+has_coords_brith17 <- cumberland17 %>% 
+  filter(!is.na(vipGeoMothersResLatitude) & !is.na(vipGeoMothersResLongitude))
+dim(has_coords_brith17)
+dim(cumberland17)
+```
+
+## 2018
+
+```{r}
+birth18 <- readr::read_fwf(
+  '~/Downloads/NJ DCF PAP Project_5-3-2022/NJ DOH Birth Data_2018.txt',
+  fwf_positions(start=keep_cols$START, end=keep_cols$END, col_names=keep_cols$VARIABLE_NAME))
+```
+
+```{r}
+cumberland18 <- birth18 %>% filter(vipMothersResCountyName %in% c('CUMBERLAND', NA) & vipMothersResTownName %in% c('MILLVILLE', 'VINELAND', 'COMMERCIAL TOWNSHIP', 'BRIDGETON') & vipMothersResStateAbbr == 'NJ')
+
+missing_county <- cumberland18 %>% filter(is.na(vipMothersResCountyName))
+wrong_county <- cumberland18 %>% filter(!is.na(vipMothersResCountyName) & vipMothersResCountyName != 'CUMBERLAND')
+
+has_coords_brith18 <- cumberland18 %>% 
+  filter(!is.na(vipGeoMothersResLatitude) & !is.na(vipGeoMothersResLongitude))
+dim(has_coords_brith18)
+dim(cumberland18)
+```
+
+## 2019
+
+```{r}
+birth19 <- readr::read_fwf(
+  '~/Downloads/NJ DCF PAP Project_5-3-2022/NJ DOH Birth Data_2019.txt',
+  fwf_positions(start=keep_cols$START, end=keep_cols$END, col_names=keep_cols$VARIABLE_NAME))
+```
+
+```{r}
+bad_rows_19 <- problems()
+```
+
+```{r}
+cumberland19 <- birth19 %>% filter(vipMothersResCountyName %in% c('CUMBERLAND', NA) & vipMothersResTownName %in% c('MILLVILLE', 'VINELAND', 'COMMERCIAL TOWNSHIP', 'BRIDGETON') & vipMothersResStateAbbr == 'NJ')
+
+missing_county <- cumberland19 %>% filter(is.na(vipMothersResCountyName))
+wrong_county <- cumberland19 %>% filter(!is.na(vipMothersResCountyName) & vipMothersResCountyName != 'CUMBERLAND')
+
+has_coords_brith19 <- cumberland19 %>% 
+  filter(!is.na(vipGeoMothersResLatitude) & !is.na(vipGeoMothersResLongitude))
+dim(has_coords_brith19)
+dim(cumberland19)
+```
+
+## Combine all years
+
+```{r}
+cumberland17<-cumberland17 %>% 
+  mutate(year=2017) %>% 
+  mutate(across(everything(), as.character))
+cumberland18<-cumberland18 %>% 
+  mutate(year=2018) %>% 
+  mutate(across(everything(), as.character))
+cumberland19<-cumberland19 %>% 
+  mutate(year=2019) %>% 
+  mutate(across(everything(), as.character))
+
+
+cumberland_birth <- bind_rows(cumberland17, cumberland18, cumberland19)
+
+```
+
+```{r}
+to_geocode <- cumberland_birth %>% 
+  filter(is.na(vipGeoMothersResLatitude) & is.na(vipGeoMothersResLongitude)) %>%
+  select(c("vipMothersResStateAbbr","vipMothersResCountyName","vipMothersResTownName","vipMothersResStreetNumber",
+           "vipMothersResStreetName","vipMothersResStreetTypeDesc","vipMothersResAptNbr","vipMothersResZip",
+           "vipMothersResZipExt")) %>%
+  distinct()
+```
+
+```{r}
+sufficient_inf_birth <- to_geocode %>%
+  filter(vipMothersResStreetNumber != '') %>%
+  filter(vipMothersResTownName != '') %>% 
+  filter(vipMothersResStreetName != '') %>%
+  filter(vipMothersResStreetTypeDesc != '') %>%
+  filter(vipMothersResZip != '')
+
+total_obs_birth <- dim(birth17)[1] + dim(birth18)[1] + dim(birth19)[1]
+total_obs_cumberland_birth <- dim(cumberland_birth)[1]
+total_distinct_obs_cumberland_to_geocode_birth <- dim(to_geocode)[1]
+total_with_sufficient_info_birth <- dim(sufficient_inf_birth)[1]
+
+summary_data_birth <- tibble(
+  source=c('birth'),
+  total_observations=total_obs_birth,
+  total_in_Cumberland=total_obs_cumberland_birth,
+  total_in_Cumberland_distinct=total_distinct_obs_cumberland_to_geocode_birth,
+  total_in_Cumberland_with_sufficient_inf=total_with_sufficient_info_birth
+)
+
+final_summary <- bind_rows(summary_data_birth, summary_data)
+kable(final_summary)
+
+```
+
+
+```{r}
+write.csv(to_geocode, '~/PredictAlign/align-data/NJ_DOH_Birth_Data_2017_2018_2019_to_geocode.csv')
+write.csv(cumberland_birth, '~/PredictAlign/align-data/NJ_DOH_Birth_Data_2017_2018_2019_CumberlandCounty.csv')
+
+```

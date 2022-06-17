@@ -1,0 +1,1029 @@
+---
+title: "Cumberland County, NJ Data Processing Workflow"
+output:
+  html_document:
+    toc: true
+    theme: united
+    toc_depth: 6
+    toc_float: yes
+---
+
+```{r clean}
+# a clean slate each time
+rm(list=ls())
+```
+
+```{r setup, include=FALSE, warning=FALSE, messages=FALSE, echo=FALSE, cache=FALSE}
+# default to suppress all code chunks unless explicitly indicated
+knitr::opts_chunk$set(include=FALSE, warning=FALSE, 
+                      message=FALSE, echo=FALSE, cache=TRUE, fig.align="center")
+```
+
+# Background
+
+# Environment setup
+
+TODO: define a conda environment to share with project documentation (current env is not contained in conda)
+TODO: notes/guidelines about working with PII?
+
+The data processing workflow is informed by the [spatialML_package](https://github.com/urbanSpatial/spatialML_package) produced by [UrbanSpatial](http://urbanspatialanalysis.com/) and customized for the State of New Jersey Division of Youth and Family Services.
+
+This work relies on several R packages, imported below:
+
+```{r load-pkgs, include=TRUE, echo=TRUE}
+library("sf")            # Spatial data objects and methods
+library("ggmap")         # ggplot2 addon for base maps
+library("cowplot")
+library("raster")        # cell-based spatial operations
+library("tidyverse")     # data manipulation framework
+library("knitr")         # for kable table
+library("viridis")
+library("viridisLite")
+library("tidycensus")
+library("tigris")
+library("lubridate")
+library("readr")
+library("units")
+```
+
+We have defined custom several helper functions in `fishnet.r` and `map_themes.r` to assist with data processing and visualization. Load these functions into the environment with the `source()` function.
+
+```{r load-custom-fxns, include=TRUE, echo=TRUE}
+source('~/predict-align-prevent/R/fishnet.r')
+source('~/predict-align-prevent/R/map_themes.r')
+```
+
+# Data processing
+
+## Geocoding
+
+TODO: summary of how geocoding is done using https://github.com/kellypierce/geocode-tools
+
+## Coordinate reference systems
+
+We use two coordinate reference systems (CRS):
+
+- WGS84 is used for map visualizations
+- The New Jersey State Planar coordinate reference system is used for euclidean distance calculations that would otherwise be distorted if attempted on an ellipsoid projection such as WGS84.
+
+
+```{r geometry-constants, include=TRUE, echo=TRUE}
+WGS84 = 4326
+NJ_PLANAR = 'ESRI:102311'
+```
+
+We also load some generic information about Cumberland County, our area of interest. The `load_neighborhood()` method loads a shapefile of New Jersey counties from the [New Jersey Open Data Portal](https://opendata.arcgis.com/datasets/5f45e1ece6e14ef5866974a7b57d3b95_1.geojson) and converts the CRS to the WGS84 CRS for compatibility with Landscan data. This function also accepts arguments to load data from different areas and can convert to a different CRS if desired.
+
+We use the `extract_area()` method to select Cumberland County from the New Jersey county shapefile, and then use `collect_basemap()` to download a basemap of Cumberland County to use in map visualizations.
+
+```{r neighborhoods-basemaps, include=TRUE, echo=TRUE}
+# load and prep general purpose data
+nj <- load_neighborhood(url='https://opendata.arcgis.com/datasets/5f45e1ece6e14ef5866974a7b57d3b95_1.geojson', crs=NJ_PLANAR)
+cumberland <- extract_area(nj)
+cumberland_bm <- collect_basemap(cumberland, crs=WGS84)
+```
+
+## Maltreatment data
+
+### Load data
+
+```{r load-incidents, include=TRUE, echo=TRUE}
+# incidents data
+geocoded_incidents <- read.csv('~/PredictAlign/171819_NJ_geocoded_incidents.csv')
+geocoded_incidents$intake_year <- lubridate::year(geocoded_incidents$Intake.RcvdDate)
+incidents_shp <- create_incidents_sf(geocoded_incidents, initial_crs=WGS84, transform_crs=NJ_PLANAR)
+```
+
+```{r maltrt-by-county}
+
+geocoded_incidents_summary <- geocoded_incidents %>% filter(state_fips==34) %>% group_by(intake_year, county_fips) %>% 
+  summarise(records = sum(n())) %>% mutate(county_fips=as.character(county_fips))
+nj_county_fips <- nj %>% st_drop_geometry() %>% dplyr::select(COUNTY_LABEL, FIPSCO)
+geocoded_incidents_summary <- left_join(geocoded_incidents_summary, nj_county_fips, by=c('county_fips'='FIPSCO'))
+#geocoded_incidents_summary <- geocoded_incidents_summary %>% dplyr::select(-county_fips)
+names(geocoded_incidents_summary) <- c('year', 'n_records', 'county')
+#write.csv(geocoded_incidents_summary, '~/PredictAlign/data_summaries/171819_NJ_geocoded_incidents_summary.csv')
+
+```
+
+### Merge incident and geocoded data
+
+TODO: geocoding work was done in a couple of different places and should be unified here for record-keeping purposes.
+
+TODO: address exploration is also a stand-alone Rmd; remove this section or (alternatively) expand it?
+
+### Unique entries vs unique incidents
+
+Each row in the incidents data file represents a unique report or entry. However, if a child is a victim on multiple occasions or involved in multiple investigations that individual may appear multiple times in the data set. We do not have identifying information or unique IDs for each individual in the data set, but we can make some simple assumptions to approximate the number of unique victims.
+
+We assume that each unique combination of intake received date (`Intake.RcvdDate`), incident address (`full_addr`), and child age (`Intake.ChildAge`) represents a unique individual. There may be multiple intakes on the same date of children of the same age from the same address (for example, when schools or daycares are the incident locations) but we assume this is a negligible fraction of the intakes.
+
+```{r explore-incidents, include=TRUE, echo=TRUE}
+# unique address-intake date-child age combinations
+addr_incidents <- geocoded_incidents %>% 
+  filter(match_indicator=='Match') %>%
+  group_by(Intake.RcvdDate, full_addr, Intake.ChildAge) %>% 
+  tally()
+
+addr_incidents$intake_year <- lubridate::year(addr_incidents$Intake.RcvdDate)
+unique_geocodes <- geocoded_incidents %>% select(full_addr, lat, lon) %>% distinct()
+unique_incidents <- addr_incidents %>%
+  group_by(intake_year, full_addr) %>%
+  summarise(estimated_n = sum(n))
+
+# make a shapefile of the presumed unique incidents
+unique_geocoded_incidents <- left_join(unique_incidents, unique_geocodes, by='full_addr')
+unique_incidents_shp <- create_incidents_sf(unique_geocoded_incidents, initial_crs=WGS84, transform_crs=NJ_PLANAR)
+```
+
+```{r addr-hist}
+hist(unique_incidents$estimated_n)
+unique_incidents %>% filter(estimated_n > 20)
+```
+
+### Gridded maltreatment data
+
+TODO: brief description of fishnets and why we use them.
+
+We want to describe both the raw count of maltreatment events and the incidence of maltreatment per 100 people. We use the American Community Survey to obtain population estimates by census block group for Cumberland County in 2017, 2018 and 2019. These population data allow us to calculate maltreatment incidence per 100 people.
+
+We also want to explore the spatial scale used for the analysis, so we perform this calculation for two different fishnet grid resolutions: 0.5mi width (0.25mi^2) and 1mi width (1mi^2).
+
+```{r inc-fishnets, eval=FALSE, include=TRUE, echo=TRUE}
+# years in incident, risk, and protective data (incidents only span 2017-2019)
+years <- 2017:2019
+resolutions <- c(0.5, 1)
+inc_fishnets_list = list()
+unique_fishnets_list = list()
+for(i in seq_along(years)){
+  # filter incidents by year
+  year_incidents <- incidents_shp %>% filter(intake_year==years[i])
+  unique_year_incidents <- unique_incidents_shp %>% filter(intake_year==years[i])
+  # get population for that year
+  year_pop <- collect_population(key_path='~/CooksProTX/us_census_api_key.txt', year=years[i], crs=NJ_PLANAR)
+  for(j in seq_along(resolutions)){  # population fishnet
+    pop_net <- create_population_fishnet(pop_data=year_pop, cover_area=cumberland, fishnet_size=resolutions[j], fishnet_units='mi')
+    # incident fishnet
+    year_res <- paste(years[i], resolutions[j], sep='_')
+    inc_fishnets_list[[year_res]] <- create_incidents_fishnet(pop_fishnet=pop_net, incidents_data=year_incidents)
+    unique_fishnets_list[[year_res]] <- create_incidents_fishnet(pop_fishnet=pop_net, incidents_data=unique_year_incidents)
+  }
+}
+```
+
+Landscan 30 arcsecond (approx 1km) grid.
+
+Landscan data cannot be reprojected in their original raster format. However, we have previously converted the landscan raster to a shapefile with the following procedure:
+
+- raster data are converted to points such that each population cell is associated with a single (lat, lon) coordinate
+- the (lat, lon) coordinates for each point are taken to be centroids of non-overlapping squares with 30 arcsecond (0.00833 decimal degree) sides
+- the four points defining the square polygon (xmin, xmax, ymin and ymax) are calculated as (lon-0.00833, lon+0.00833, lat-0.00833, lat+0.00833).
+
+The Landscan shapefile can then be safely reprojected in the NJ State Planar projection without resampling of population data.
+
+```{r nj-landscan}
+landscan <- st_read('~/predict-align-prevent/landscan/NJ_1km_grid_2019/NJ_1km_grid_2019.shp') %>% st_transform(NJ_PLANAR)
+
+landscan_cumberland <- st_intersection(cumberland, landscan) %>% select('geometry', 'population')
+
+incidents2019 <- incidents_shp %>% filter(intake_year==2019)
+unique2019 <- unique_incidents_shp %>% filter(intake_year==2019)
+# get population for 2019
+pop2019 <- collect_population(key_path='~/CooksProTX/us_census_api_key.txt', year=2019, crs=NJ_PLANAR)
+
+# add "net_id", "unitless_net_pop" and "net_pop" columns
+landscan_cumberland$net_id <- seq.int(nrow(landscan_cumberland))
+landscan_cumberland$unitless_net_pop <- landscan_cumberland$population
+landscan_cumberland$net_pop <- landscan_cumberland$population
+units(landscan_cumberland$net_pop) <- units(pop_net$net_pop)
+inc_landscan <- create_incidents_fishnet(pop_fishnet=landscan_cumberland, incidents_data=incidents2019)
+unique_landscan <- create_incidents_fishnet(pop_fishnet=landscan_cumberland, incidents_data=unique2019)
+
+# add the landscan fishnets to the lists
+inc_fishnets_list[['2019_landscan']] <- inc_landscan
+unique_fishnets_list[['2019_landscan']] <- unique_landscan
+```
+
+```{r save-rds, eval=FALSE}
+# save these objects to speed up knitting the final documentation
+saveRDS(inc_fishnets_list, '~/PredictAlign/inc_fishnets_list.rds')
+saveRDS(unique_fishnets_list, '~/PredictAlign/unique_fishnets_list.rds')
+```
+
+```{r load-rds}
+inc_fishnets_list <- readRDS('~/PredictAlign/inc_fishnets_list.rds')
+unique_fishnets_list <- readRDS('~/PredictAlign/unique_fishnets_list.rds')
+```
+
+### Urban vs rural areas
+
+TODO: brief note on why the distinction might matter (e.g. different number of cases, different population densities, etc.)
+
+Cumberland County contains a mixture of urban and rural areas, so we use US Census Bureau -defined urban areas to classify each fishnet grid cell as rural or belonging to an urban area. We check to make sure these assignment are unique (each grid cell is assigned to one and only one type of area), and generate maps to visualize how the fishnet grid size influences the spatial classifications.
+
+```{r urban-rural-categories, include=TRUE, echo=TRUE}
+
+# load urban areas shapefile
+urban <- st_read('~/CooksProTX/spatial/tigris/usa_urban_areas/urban_areas_2019/urban_areas_2019.shp')
+nj_urban <- urban %>% filter(grepl('NJ', NAME10)) %>% st_transform(crs=crs(inc_fishnets_list[[1]]))
+
+# only need geometry from one of the fishnets at each resolution
+fishnet_half_mi <- inc_fishnets_list[[1]] %>% select(net_id, geometry)
+fishnet_one_mi <- inc_fishnets_list[[2]] %>% select(net_id, geometry)
+landscan_geometry <- inc_fishnets_list[['2019_landscan']] %>% select(net_id, geometry)
+
+# manual inspection of the data shows these as the urban areas of interest
+cumberland_urban_areas <- c(
+  'Vineland, NJ Urbanized Area',
+  'Bridgeton, NJ Urban Cluster',
+  'Laurel Lake, NJ Urban Cluster'
+)
+
+# intersect urban areas with fishnet and get lists of net ids in each urban area
+fishnet_one_mi_urban_areas <- list()
+fishnet_half_mi_urban_areas <- list()
+fishnet_landscan_urban_areas <- list()
+for(k in seq_along(cumberland_urban_areas)){
+  urban_area <- nj_urban %>% filter(NAMELSAD10==cumberland_urban_areas[k])
+  ## HALF MILE FISHNET
+  net_intersect_05 <- st_intersects(urban_area, fishnet_half_mi)
+  net_cover_area_05 <- fishnet_half_mi[unique(unlist(net_intersect_05)),]
+  fishnet_half_mi_urban_areas[[cumberland_urban_areas[k]]] <- unique(net_cover_area_05$net_id)
+  ## ONE MILE FISHNET
+  net_intersect_1 <- st_intersects(urban_area, fishnet_one_mi)
+  net_cover_area_1 <- fishnet_one_mi[unique(unlist(net_intersect_1)),]
+  fishnet_one_mi_urban_areas[[cumberland_urban_areas[k]]] <- unique(net_cover_area_1$net_id)
+  ## LANDSCAN FISHNET
+  net_intersect_ls <- st_intersects(urban_area, landscan_cumberland)
+  net_cover_area_ls <- landscan_geometry[unique(unlist(net_intersect_ls)),]
+  fishnet_landscan_urban_areas[[cumberland_urban_areas[k]]] <- unique(net_cover_area_ls$net_id)
+}
+
+fishnet_half_mi <- fishnet_half_mi %>% mutate(
+  urban_area = case_when(
+    (net_id %in% fishnet_half_mi_urban_areas[[1]]) ~ cumberland_urban_areas[1],
+    (net_id %in% fishnet_half_mi_urban_areas[[2]]) ~ cumberland_urban_areas[2],
+    (net_id %in% fishnet_half_mi_urban_areas[[3]]) ~ cumberland_urban_areas[3]
+  )
+)
+fishnet_half_mi$urban_area <- replace_na(fishnet_half_mi$urban_area, 'rural')
+
+fishnet_one_mi <- fishnet_one_mi %>% mutate(
+  urban_area = case_when(
+    (net_id %in% fishnet_one_mi_urban_areas[[1]] & net_id != 363) ~ cumberland_urban_areas[1],
+    (net_id %in% fishnet_one_mi_urban_areas[[2]]) ~ cumberland_urban_areas[2],
+    (net_id %in% fishnet_one_mi_urban_areas[[3]] & net_id != 363) ~ cumberland_urban_areas[3],
+    (net_id == 363) ~ 'Vineland and Laurel Lake overlap'
+  )
+)
+fishnet_one_mi$urban_area <- replace_na(fishnet_one_mi$urban_area, 'rural')
+
+landscan_geometry <- landscan_geometry %>% mutate(
+  urban_area = case_when(
+    (net_id %in% fishnet_landscan_urban_areas[[1]]) ~ cumberland_urban_areas[1],
+    (net_id %in% fishnet_landscan_urban_areas[[2]]) ~ cumberland_urban_areas[2],
+    (net_id %in% fishnet_landscan_urban_areas[[3]]) ~ cumberland_urban_areas[3]
+  )
+)
+landscan_geometry$urban_area <- replace_na(landscan_geometry$urban_area, 'rural')
+
+# sanity check with maps
+half_mi_map <- ggmap(cumberland_bm) + 
+  geom_sf(data=st_transform(fishnet_half_mi, crs=4326), aes(fill=urban_area), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  geom_sf(data=nj_urban, aes(size=1.5), color='black', inherit.aes=FALSE, alpha=0) +
+  scale_size_identity() +
+  labs(title='Half-mile fishnet')
+
+one_mi_map <- ggmap(cumberland_bm) + 
+  geom_sf(data=st_transform(fishnet_one_mi, crs=4326), aes(fill=urban_area), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  geom_sf(data=nj_urban, aes(size=1.5), color='black', inherit.aes=FALSE, alpha=0) +
+  scale_size_identity() +
+  labs(title='One-mile fishnet')
+
+landscan_map <- ggmap(cumberland_bm) + 
+  geom_sf(data=st_transform(landscan_geometry, crs=4326), aes(fill=urban_area), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  geom_sf(data=nj_urban, aes(size=1.5), color='black', inherit.aes=FALSE, alpha=0) +
+  scale_size_identity() +
+  labs(title='Landscan fishnet')
+  
+cowplot::plot_grid(one_mi_map, half_mi_map, landscan_map)
+```
+
+```{r check-fn}
+# confirm urban area assignment is unique for fishnet cells
+intersect(fishnet_one_mi_urban_areas[[1]], fishnet_one_mi_urban_areas[[2]])
+intersect(fishnet_one_mi_urban_areas[[1]], fishnet_one_mi_urban_areas[[3]]) # at this resolution, net_id 363 is shared between Vineland and Laurel Lake
+intersect(fishnet_one_mi_urban_areas[[3]], fishnet_one_mi_urban_areas[[2]])
+
+intersect(fishnet_half_mi_urban_areas[[1]], fishnet_half_mi_urban_areas[[2]])
+intersect(fishnet_half_mi_urban_areas[[1]], fishnet_half_mi_urban_areas[[3]])
+intersect(fishnet_half_mi_urban_areas[[3]], fishnet_half_mi_urban_areas[[2]])
+```
+
+Now that we have defined fishnet grids and their year-to-year populations, we can combine these grids with the maltreatment data.
+
+```{r combine-fishnets, include=TRUE, echo=TRUE}
+# list names are the same for inc_fishnets_list and unique_fishnets_list
+one_mi_inc_names <- names(inc_fishnets_list)[grepl('_1', names(inc_fishnets_list))]
+half_mi_inc_names <- names(inc_fishnets_list)[grepl('_0.5', names(inc_fishnets_list))]
+landscan_inc_names <- names(inc_fishnets_list)[grepl('_landscan', names(inc_fishnets_list))]
+
+fn1mi <- fishnet_one_mi %>% select(net_id, urban_area) %>% st_drop_geometry
+fn05mi <- fishnet_half_mi %>% select(net_id, urban_area) %>% st_drop_geometry
+fnlandscan <- landscan_geometry %>% select(net_id, urban_area) %>% st_drop_geometry
+
+for(i in seq_along(one_mi_inc_names)){
+  
+  # raw
+  data <- inc_fishnets_list[[one_mi_inc_names[i]]]
+  data <- left_join(data, fn1mi, by='net_id')
+  inc_fishnets_list[[one_mi_inc_names[i]]] <- data
+  
+  # unique
+  udata <- unique_fishnets_list[[one_mi_inc_names[[i]]]]
+  udata <- left_join(udata, fn1mi, by='net_id')
+  unique_fishnets_list[[one_mi_inc_names[[i]]]] <- udata
+}
+
+for(i in seq_along(half_mi_inc_names)){
+  
+  # raw
+  data <- inc_fishnets_list[[half_mi_inc_names[i]]]
+  data <- left_join(data, fn05mi, by='net_id')
+  inc_fishnets_list[[half_mi_inc_names[i]]] <- data
+  
+  # unique
+  udata <- unique_fishnets_list[[half_mi_inc_names[i]]]
+  udata <- left_join(udata, fn05mi, by='net_id')
+  unique_fishnets_list[[half_mi_inc_names[i]]] <- udata
+}
+
+for(i in seq_along(landscan_inc_names)){
+  
+  # raw
+  data <- inc_fishnets_list[[landscan_inc_names[i]]]
+  data <- left_join(data, fnlandscan, by='net_id')
+  inc_fishnets_list[[landscan_inc_names[i]]] <- data
+  
+  # unique
+  udata <- unique_fishnets_list[[landscan_inc_names[i]]]
+  udata <- left_join(udata, fnlandscan, by='net_id')
+  unique_fishnets_list[[landscan_inc_names[i]]] <- udata
+}
+```
+
+### Maltreatment risk categories
+
+Next we assign risk categories for each year and fishnet grid resolution combination. Most grid cells, regardless of the spatial resolution, contain no incidents of child maltreatment. We exclude these zeros when calculating risk categories so that our risk assessment focuses on areas where maltreatment is reported rather that the large area where it either does not occur or is not reported.
+
+```{r risk-categories, include=TRUE, echo=TRUE}
+# get risk categories
+get_risk_categories <- function(dataset, column){
+  # define 4 quantiles that map to 5 risk categories, excluding zero counts
+  nonzero <- dataset %>% filter(.data[[column]] > 0) %>% filter(.data[[column]] != Inf)
+  quantiles <- stats::quantile(nonzero[[column]], probs=c(0.3, 0.5, 0.7, 0.9))
+  new_name <- paste(column, 'risk_category', sep='_')
+  nonzero[[new_name]] <- sapply(nonzero[[column]], assign_risk_cat, quantiles)
+  nonzero[[new_name]] <- factor(nonzero[[new_name]], levels=c(1, 2, 3, 4, 5))
+  return(nonzero)
+}
+
+# raw
+for(d in seq_along(inc_fishnets_list)){
+  rc <- get_risk_categories(inc_fishnets_list[[d]], column='incident_count')
+  rc <- get_risk_categories(rc, column='inc_per_100')
+  inc_fishnets_list[[d]] <- rc
+}
+
+# unique
+for(d in seq_along(unique_fishnets_list)){
+  rc <- get_risk_categories(unique_fishnets_list[[d]], column='incident_count')
+  rc <- get_risk_categories(rc, column='inc_per_100')
+  unique_fishnets_list[[d]] <- rc
+}
+```
+
+### Finalize maltreatment data
+
+At this point we have described the annual population, maltreatment count, maltreatment incidence, and percentile-based maltreatment risk for Cumberland County. We save these data in two ways: first as a shapefile that contains the grid cell geometries, and second as a comma-separated file that contains the grid cell centroids.
+
+```{r finalize, include=TRUE, echo=TRUE}
+for(l in seq_along(inc_fishnets_list)){
+  indicators <- unlist(strsplit(names(inc_fishnets_list)[l], split='_'))
+  inc_fishnets_list[[l]]$intake_year <- indicators[1]
+  inc_fishnets_list[[l]]$fishnet_resolution_mi <- indicators[2]
+  inc_fishnets_list[[l]]$summary_type <- 'raw_count'
+}
+for(l in seq_along(unique_fishnets_list)){
+  indicators <- unlist(strsplit(names(unique_fishnets_list)[l], split='_'))
+  unique_fishnets_list[[l]]$intake_year <- indicators[1]
+  unique_fishnets_list[[l]]$fishnet_resolution_mi <- indicators[2]
+  unique_fishnets_list[[l]]$summary_type <- 'unique_addr_child_age_combination'
+}
+
+all_raw <- bind_rows(inc_fishnets_list)
+all_unique <- bind_rows(unique_fishnets_list)
+all <- bind_rows(all_raw, all_unique)
+all <- all %>% mutate(
+  summary_type = case_when(
+    (summary_type == 'raw_count') ~ 'all incidents',
+    (summary_type == 'unique_addr_child_age_combination') ~ 'unique incidents'
+  )
+)
+
+all_final <- all %>% select(-unitless_net_pop, -population)
+names(all_final) <- c(
+  'net_id', 'net_pop', 'geometry', 'count', 'count100', 'area', 
+  'count_risk', 'inc_risk', 'year',
+  'fn_width', 'type')
+#st_write(all_final, '~/PredictAlign/PredictAlignFishnets/cumberland_fishnets_urban_areas_and_maltreatment_aggregations_with_landscan.shp')
+
+all_centroids <- all_final %>% 
+  st_centroid() %>%
+  st_transform(crs=WGS84) %>%
+  mutate(
+    fishnet_centroid_lon=sf::st_coordinates(.)[,1],
+    fishnet_centroid_lat=sf::st_coordinates(.)[,2]) %>%
+  st_drop_geometry()
+```
+
+```{r write-agg, eval=FALSE}
+#write.csv(all_centroids, '~/PredictAlign/PredictAlignFishnets/cumberland_fishnets_urban_areas_and_maltreatment_aggregations_with_landscan.csv')
+```
+
+#### Maltreatment, one-mile grid
+
+TODO: proper figure legend
+
+```{r onemi-maltrt, include=TRUE, echo=TRUE, out.width='4000px'}
+one_mi_raw_map <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(
+      filter(all_final, fn_width=='1'), 
+      crs=4326
+      ), aes(fill=count_risk), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  facet_grid(type ~ year) +
+  scale_fill_viridis_d(
+    na.value = NA,
+    option = "D",
+    direction = 1,
+    name = ""
+  ) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 14, family = "sans"),
+    legend.text = element_text(size = 9, family = "sans")) +
+  labs(title='Risk by count, 1mi grid')
+
+one_mi_inc_map <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(
+      filter(all_final, fn_width=='1'), 
+      crs=4326
+      ), aes(fill=inc_risk), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  facet_grid(type ~ year) +
+  scale_fill_viridis_d(
+    na.value = NA,
+    option = "D",
+    direction = 1,
+    name = ""
+  ) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 14, family = "sans"),
+    legend.text = element_text(size = 9, family = "sans")) +
+  labs(title='Risk by count per 100, 1mi grid')
+
+cowplot::plot_grid(one_mi_raw_map, one_mi_inc_map, nrow=2)
+```
+
+#### Maltreatment, half-mile grid
+
+TODO: proper figure legend
+
+```{r halfmi-maltrt, include=TRUE, echo=TRUE, out.width='2000px'}
+half_mi_raw_map <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(
+      filter(all_final, fn_width=='0.5'), 
+      crs=4326
+      ), aes(fill=count_risk), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  facet_grid(type ~ year) +
+  scale_fill_viridis_d(
+    na.value = NA,
+    option = "D",
+    direction = 1,
+    name = ""
+  ) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 14, family = "sans"),
+    legend.text = element_text(size = 9, family = "sans")) +
+  labs(title='Risk count, 1/2mi grid')
+
+half_mi_inc_map <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(
+      filter(all_final, fn_width=='0.5'), 
+      crs=4326
+      ), aes(fill=inc_risk), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  facet_grid(type ~ year) +
+  scale_fill_viridis_d(
+    na.value = NA,
+    option = "D",
+    direction = 1,
+    name = ""
+  ) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 14, family = "sans"),
+    legend.text = element_text(size = 9, family = "sans")) +
+  labs(title='Risk by count per 100, 1/2mi grid')
+
+cowplot::plot_grid(half_mi_raw_map, half_mi_inc_map, nrow=2)
+```
+
+#### Maltreatment, landscan grid
+
+```{r halfmi-maltrt, include=TRUE, echo=TRUE, out.width='2000px'}
+landscan_raw_map <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(
+      filter(all_final, fn_width=='landscan'), 
+      crs=4326
+      ), aes(fill=count_risk), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  facet_grid(type ~ year) +
+  scale_fill_viridis_d(
+    na.value = NA,
+    option = "D",
+    direction = 1,
+    name = ""
+  ) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 14, family = "sans"),
+    legend.text = element_text(size = 9, family = "sans")) +
+  labs(title='Risk count, Landscan 30 arcsecond grid')
+
+landscan_inc_map <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(
+      filter(all_final, fn_width=='landscan'), 
+      crs=4326
+      ), aes(fill=inc_risk), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  facet_grid(type ~ year) +
+  scale_fill_viridis_d(
+    na.value = NA,
+    option = "D",
+    direction = 1,
+    name = ""
+  ) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 14, family = "sans"),
+    legend.text = element_text(size = 9, family = "sans")) +
+  labs(title='Risk by count per 100, Landscan 30 arcsecond grid')
+
+cowplot::plot_grid(landscan_raw_map, landscan_inc_map, ncol=2)
+```
+
+## Risk and protective data
+
+### Load data
+
+Load the crime, violations, and risk/protective factors data.
+
+TODO: brief summary of each dataset
+TODO: summarize goal, which is to make a CSV that contains the grid cell ID for each entry in the datasets below (not to aggregate the data by grid cell as with the maltreatment data).
+
+```{r load-risk-protect, include=TRUE, echo=TRUE}
+geocoded_crime <- read.csv(
+  '~/PredictAlign/RiskProtectiveGeocoded/bridgeton_police_data_unique_addresses_geocoded.csv'
+  )
+bridgeton_crime <- read.csv(
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/Bridgeton_Crime_all.csv'
+  )
+mv_viol <- read.csv(
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/Millville_violation_100.csv'
+  )
+bt_viol <- read.csv(
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/bridgeton_violation_100.csv'
+  )
+cumberland_risk_protective2 <- read.csv(
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/risk_protect_factors.csv'
+  )
+st_pol <- read.csv(
+  '~/PredictAlign/2020Jul28_St_Pol_Jul19_Jun20_PAP_Police_Variables-tacc-no-filters.csv'
+  )
+
+```
+
+```{r risk-protect-summary}
+
+
+```
+
+Load the geocoded data for unique addresses in the risk/protective datasets.
+
+```{r load-geocodes, include=TRUE, echo=TRUE}
+# TODO: refactor the Bridgeton crime geocoding to fit in this workflow
+mv_viol_gc <- read.csv(
+  '~/PredictAlign/RiskProtectiveGeocoded/unique_geocoded_addresses/2020Jul22_Millville_Code_Enforcement_1-4_geocoded.csv'
+  )
+bt_viol_gc <- read.csv('~/PredictAlign/RiskProtectiveGeocoded/unique_geocoded_addresses/2020Jul22_Bridgeton_Violations_geocoded.csv')
+#st_pol <- read.csv('~/PredictAlign/PredictAlignFishnets/cleaned_data/St_Pol_crime.csv')
+#cumberland_risk_protective2 <- read.csv('~/PredictAlign/PredictAlignFishnets/cleaned_data/risk_protect_factors.csv')
+```
+
+Calculate the centroids of each fishnet cell.
+
+```{r fishnet-centroids, include=TRUE, echo=TRUE}
+fn05_centroid <- all_final %>% 
+  filter(fn_width=='0.5') %>%
+  st_centroid() %>%
+  st_transform(crs=WGS84) %>% 
+  mutate(
+    fishnet_centroid_lon=sf::st_coordinates(.)[,1], 
+    fishnet_centroid_lat=sf::st_coordinates(.)[,2]) %>%
+  st_drop_geometry() %>%
+  select(net_id, net_pop, area, fishnet_centroid_lon, fishnet_centroid_lat, year) %>%
+  distinct()
+
+fn1_centroid <- all_final %>% 
+  filter(fn_width=='1') %>%
+  st_centroid() %>%
+  st_transform(crs=WGS84) %>% 
+  mutate(
+    fishnet_centroid_lon=sf::st_coordinates(.)[,1],
+    fishnet_centroid_lat=sf::st_coordinates(.)[,2]) %>%
+  st_drop_geometry() %>%
+  select(net_id, net_pop, area, fishnet_centroid_lon, fishnet_centroid_lat, year) %>%
+  distinct()
+```
+
+### Gridded risk and protective data
+
+Columns must be `lat` and `lon` (not `long`).
+
+```{r bridgeton-crime, include=TRUE, echo=TRUE}
+bridgeton_crime_geocoded <- left_join(bridgeton_crime, geocoded_crime, by='Incident.Location')
+bridgeton_crime_geocoded_match <- bridgeton_crime_geocoded %>% drop_na(lat, long)
+names(bridgeton_crime_geocoded_match)[names(bridgeton_crime_geocoded_match) == 'long'] <- 'lon'
+
+bridgeton_crime_sf <- create_incidents_sf(bridgeton_crime_geocoded_match)
+bridgeton_crime_sf <- bridgeton_crime_sf %>% mutate(
+    year=as.character(
+      lubridate::year(
+        readr::parse_datetime(Report.Date...Time, "%m/%d/%Y %H:%M")
+        )
+    )
+    )
+bridgeton_crime_fishnet_half_mi <- apply_fishnet(bridgeton_crime_sf, fishnet_half_mi, fn05_centroid)
+bridgeton_crime_fishnet_half_mi$fn_width <- 0.5
+bridgeton_crime_fishnet_one_mi <- apply_fishnet(bridgeton_crime_sf, fishnet_one_mi, fn1_centroid)
+bridgeton_crime_fishnet_one_mi$fn_width <- 1
+
+bridgeton_crime_fishnet_final <- bind_rows(
+  bridgeton_crime_fishnet_half_mi,
+  bridgeton_crime_fishnet_one_mi
+  ) %>%
+  select(Report.Date...Time, year, PD.Case.., Incident.Location, 
+         Agency.Incident...Actual.CFS.Type, crime_type,
+         Address, City, State.Zip, incident_count, 
+         net_id, net_pop, urban_area, fn_width,
+         data_lon, data_lat, fishnet_centroid_lon, 
+         fishnet_centroid_lat) %>%
+  filter(year %in% 2017:2019)
+```
+
+```{r write-btcrime, eval=FALSE}
+write.csv(
+  bridgeton_crime_fishnet_final,
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/Bridgeton_Crime_all_geocoded_with_netid_wgs84.csv',
+  quote=TRUE
+  )
+```
+
+```{r millvile-violations, include=TRUE, echo=TRUE}
+# remove trailing whitespace in mv_viol address column
+mv_viol$clean_addr <- str_trim(mv_viol$Property.Location, side=c('right'))
+mv_viol_gc_combined <- left_join(mv_viol, mv_viol_gc, by=c("clean_addr"="input_address"))
+mv_viol_sf <- create_incidents_sf(mv_viol_gc_combined)
+mv_viol_sf <- mv_viol_sf %>% mutate(year=as.character(lubridate::year(Violation.Date)))
+
+mv_viol_fishnet_half_mi <- apply_fishnet(mv_viol_sf, fishnet_half_mi, fn05_centroid)
+mv_viol_fishnet_half_mi$fn_width <- 0.5
+mv_viol_fishnet_one_mi <- apply_fishnet(mv_viol_sf, fishnet_one_mi, fn1_centroid)
+mv_viol_fishnet_one_mi$fn_width <- 1
+
+mv_viol_fishnet_final <- bind_rows(mv_viol_fishnet_half_mi, mv_viol_fishnet_one_mi) %>%
+  select(Violation.Id, Block.Lot.Qual, Property.Location, Property.Class,
+         Ordinance.Id.1, Compliance.Date.1, Ordinance.1.Conditions, Violation.Date, year,
+         Status, Status.Date, Description, Conditions, violation_type, clean_addr,
+         matched_address, incident_count, net_id, net_pop, urban_area, fn_width,
+         data_lon, data_lat, fishnet_centroid_lon, fishnet_centroid_lat) %>%
+  filter(year %in% 2017:2019)
+```
+
+```{r write-mvviol, eval=FALSE}
+write.csv(
+  mv_viol_fishnet_final,
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/Millville_violations_all_geocoded_with_netid_wgs84.csv',
+  quote=TRUE
+)
+```
+
+```{r bridgeton-violations, include=TRUE, echo=TRUE}
+bt_viol_gc_combined <- left_join(bt_viol, bt_viol_gc, by=c("Location.Address"="input_address"))
+bt_viol_sf <- create_incidents_sf(bt_viol_gc_combined)
+bt_viol_sf <- bt_viol_sf %>% mutate(year=as.character(lubridate::year(Issue.Date)))
+
+bt_viol_fishnet_half_mi <- apply_fishnet(bt_viol_sf, fishnet_half_mi, fn05_centroid)
+bt_viol_fishnet_half_mi$fn_width <- 0.5
+bt_viol_fishnet_one_mi <- apply_fishnet(bt_viol_sf, fishnet_one_mi, fn1_centroid)
+bt_viol_fishnet_one_mi$fn_width <- 1
+
+bt_viol_fishnet_final <- bind_rows(bt_viol_fishnet_half_mi, bt_viol_fishnet_one_mi) %>%
+  select(Tracking.Number, Location.Address, Issue.Date, year, Statute, Statute.Number,
+         violation_type, Address, City, State, id, X.y, X.1, X.2, matched_address,
+         incident_count, net_id, net_pop, urban_area, fn_width,
+         data_lon, data_lat, fishnet_centroid_lon, fishnet_centroid_lat) %>%
+  filter(year %in% 2017:2019)
+```
+
+```{r write-btviol, eval=FALSE}
+write.csv(
+  bt_viol_fishnet_final,
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/Bridgeton_violations_all_geocoded_with_netid_wgs84.csv',
+  quote=TRUE
+)
+```
+
+```{r risk-protective, include=TRUE, echo=TRUE}
+# THE CRS IS A COMPLETE GUESS. just using a common one and hoping for the best
+# the Data Axle online documentation discusses lat/lon but does not explicitly state the CRS they use.
+crp <- st_as_sf(cumberland_risk_protective2, coords=c('Longitude', 'Latitude'), crs=4326)
+crp_planar <- st_transform(crp, crs=NJ_PLANAR)
+crp_planar$year <- NA
+
+time_independent_fn05_centroid <- fn05_centroid %>% select(net_id, fishnet_centroid_lon, fishnet_centroid_lat) %>% distinct() %>%
+  mutate(year=NA)
+time_independent_fn1_centroid <- fn1_centroid %>% select(net_id, fishnet_centroid_lon, fishnet_centroid_lat) %>% distinct() %>%
+  mutate(year=NA)
+
+crp_planar_fishnet_half_mi <- apply_fishnet(crp_planar, fishnet_half_mi, time_independent_fn05_centroid)
+crp_planar_fishnet_half_mi$fn_width <- 0.5
+crp_planar_fishnet_one_mi <- apply_fishnet(crp_planar, fishnet_one_mi, time_independent_fn1_centroid)
+crp_planar_fishnet_one_mi$fn_width <- 1
+
+crp_fishnet_final <- bind_rows(crp_planar_fishnet_half_mi, crp_planar_fishnet_one_mi) %>%
+  select(ABI.Number, Primary.SIC.4, Primary.SIC.6, PrimarySIC6.Description, Census.Tract,
+         County.Code, Census.Block,
+         net_id, urban_area, fn_width,
+         data_lon, data_lat, fishnet_centroid_lon, fishnet_centroid_lat)
+```
+
+```{r write-crp, eval=FALSE}
+write.csv(
+  crp_fishnet_final,
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/risk_protect_factors_with_netid_wgs84.csv',
+  quote=TRUE
+)
+```
+```{r state-police, include=TRUE, echo=TRUE}
+# THE CRS IS A COMPLETE GUESS. just using a common one and hoping for the best
+st_pol_complete <- st_pol %>% drop_na(Latitude, Longitude)
+st_pol_complete <- st_as_sf(st_pol_complete, coords=c('Longitude', 'Latitude'), crs=WGS84)
+st_pol_planar <- st_transform(st_pol_complete, crs=NJ_PLANAR)
+st_pol_planar <- st_pol_planar %>% mutate(year=as.character(lubridate::year(Police.report.date)))
+
+st_pol_fishnet_half_mi <- apply_fishnet(st_pol_planar, fishnet_half_mi, fn05_centroid)
+st_pol_fishnet_half_mi$fn_width <- 0.5
+st_pol_fishnet_one_mi <- apply_fishnet(st_pol_planar, fishnet_one_mi, fn1_centroid)
+st_pol_fishnet_one_mi$fn_width <- 1
+
+st_pol_fishnet_final <- bind_rows(st_pol_fishnet_one_mi, st_pol_fishnet_half_mi) %>% 
+  select(Data.Source, Crime.Code, Police.report.number, Police.report.date, year, 
+         Police.report.time.of.day,
+         Location..Address...Street.Number, Location..Address...Street.Name, County, Municipality, crime_type,
+         net_id, net_pop, urban_area, fn_width,
+         data_lon, data_lat, fishnet_centroid_lon, fishnet_centroid_lat) %>%
+  filter(year %in% 2017:2019)
+```
+
+```{r write-stpol, eval=FALSE}
+write.csv(
+  st_pol_fishnet_final,
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/St_Pol_crime_with_netid_wgs84.csv',
+  quote=TRUE
+)
+```
+
+```{r summaries, include=TRUE, echo=TRUE, out.width='2000px'}
+#### FISHNET SUMMARIES ####
+bridgeton_crime_fishnet_final$source <- 'Bridgeton Crime'
+mv_viol_fishnet_final$source <- 'Millville Violations'
+bt_viol_fishnet_final$source <- 'Bridgeton Violations'
+crp_fishnet_final$source <- 'Cumberland Risk/Protective Factors'
+st_pol_fishnet_final$source <- 'State Police'
+
+risk_protect_data <- list()
+risk_protect_data[[1]] <- bridgeton_crime_fishnet_final
+risk_protect_data[[2]] <- mv_viol_fishnet_final
+risk_protect_data[[3]] <- bt_viol_fishnet_final
+risk_protect_data[[4]] <- st_pol_fishnet_final
+
+summary_cols <- c('net_id', 'source', 'fn_width', 'year')
+
+for(d in seq_along(risk_protect_data)){
+  summary_data <- risk_protect_data[[d]][, summary_cols]
+  summary_data <- summary_data %>% group_by_at(summary_cols) %>% summarise(n=sum(n()))
+  risk_protect_data[[d]] <- summary_data
+}
+
+risk_protect_summary <- bind_rows(risk_protect_data)
+risk_protect_one_mi <- risk_protect_summary %>% 
+  filter(fn_width==1) %>%
+  left_join(fishnet_one_mi, by='net_id') %>%
+  st_as_sf(crs=NJ_PLANAR)
+risk_protect_half_mi <- risk_protect_summary %>% 
+  filter(fn_width==0.5) %>%
+  left_join(fishnet_half_mi, by='net_id') %>%
+  st_as_sf(crs=NJ_PLANAR)
+
+one_mi_urban <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(risk_protect_one_mi,crs=WGS84), 
+    aes(fill=source), inherit.aes=FALSE, alpha=1) +
+  facet_wrap(.~year) +
+  theme(plot.title=element_text(size=14)) +
+  #geom_sf(data=fishnet_one_mi, inherit.aes=FALSE, alpha=0) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 22, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 8, family = "sans"),
+    legend.text = element_text(size = 6, family = "sans"))
+
+half_mi_urban <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(risk_protect_half_mi,crs=WGS84), 
+    aes(fill=source), inherit.aes=FALSE, alpha=1) +
+  facet_wrap(.~year) +
+  theme(plot.title=element_text(size=14)) +
+  #geom_sf(data=fishnet_half_mi, inherit.aes=FALSE, alpha=0) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 22, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 8, family = "sans"),
+    legend.text = element_text(size = 6, family = "sans"))
+
+cowplot::plot_grid(one_mi_urban, half_mi_urban, nrow=2)
+
+```
+
+Inspect crime volume (data volume) by data source
+
+```{r crime-volume, include=TRUE, echo=TRUE}
+bc_tally <- bridgeton_crime_sf %>% st_drop_geometry() %>% group_by(year) %>% summarise(n=sum(n())) %>% mutate(source='Bridgeton Crime')
+mv_tally <- mv_viol_sf %>% st_drop_geometry() %>% group_by(year) %>% summarise(n=sum(n())) %>% mutate(source='Millville Violations')
+bv_tally <- bt_viol_sf %>% st_drop_geometry() %>% group_by(year) %>% summarise(n=sum(n())) %>% mutate(source='Bridgeton Violations')
+st_tally <- st_pol_planar %>% st_drop_geometry() %>% group_by(year) %>% summarise(n=sum(n())) %>% mutate(source='NJ State Police Crime')
+
+annual_tallies <- bind_rows(bc_tally, mv_tally, bv_tally, st_tally)
+
+g <- ggplot(annual_tallies %>% filter(year %in% 2017:2019), aes(x=year, y=n, fill=source)) + 
+  geom_bar(stat='identity', position="dodge") +
+theme(
+  axis.text.x = element_text(size=14),
+  axis.text.y = element_text(size=14),
+  text = element_text(size=14),
+  legend.title = element_text(size = 14, family = "sans"),
+  legend.text = element_text(size = 14, family = "sans")
+)
+g
+
+```
+
+## Census data
+
+TODO: motivation for including
+
+```{r census, eval=FALSE, include=TRUE, echo=TRUE}
+# Census data and census tract shapes (not all variables of interest are at the block group level, so all are downloaded by tract)
+nj_census <- read.csv('~/PredictAlign/nj-pap-census-vars_20210610154857.csv')
+nj_census$GEOID <- as.character(nj_census$GEOID)
+cumberland_tract <- tigris::tracts(state=34, county=11, year=2019)
+tract_census <- left_join(cumberland_tract, nj_census, by='GEOID')
+tract_census <- st_transform(tract_census, crs='ESRI:102311')
+
+colnames_ <- names(tract_census)
+estimate_cols <- colnames_[grepl('^E', colnames_)]
+
+fishnet_data = list()
+for(i in seq_along(estimate_cols)){
+  ec <- estimate_cols[i]
+  est_subset <- tract_census %>% select(.data[[ec]])
+  est_subset$block_area <- st_area(est_subset$geometry)
+  est_subset$pop_rate = est_subset[[ec]]/est_subset$block_area # the population data are in column "estimate"
+  names(est_subset) <- c('estimate', 'geometry', 'block_area', 'pop_rate')
+  est_subset_net_one_mi <- create_population_fishnet(
+    pop_data=est_subset, 
+    cover_area=cumberland, 
+    fishnet_size=1, 
+    fishnet_units='mi'
+  )
+  est_subset_net_half_mi <- create_population_fishnet(
+    pop_data=est_subset, 
+    cover_area=cumberland, 
+    fishnet_size=0.5, 
+    fishnet_units='mi'
+  )
+  est_subset_net_one_mi <- est_subset_net_one_mi %>% select(-unitless_net_pop)
+  est_subset_net_half_mi <- est_subset_net_half_mi %>% select(-unitless_net_pop)
+  
+  est_subset_net_one_mi$fn_width <- 1
+  est_subset_net_half_mi$fn_width <- 0.5
+  
+  est_subset_net <- bind_rows(est_subset_net_one_mi, est_subset_net_half_mi)
+  names(est_subset_net) <- c('net_id', ec, 'geometry', 'fn_width')
+
+  est_subset_net <- est_subset_net %>% st_drop_geometry() %>% as_tibble()
+  fishnet_data[[i]] <- est_subset_net
+}
+
+final_summary <- fishnet_data[[1]]
+for(k in 2:length(fishnet_data)){
+  final_summary <- full_join(final_summary, fishnet_data[[k]], by=c('net_id', 'fn_width'))
+}
+
+final_summary_unitless <- units::drop_units(final_summary)
+fishnet_half_mi$fn_width <- 0.5
+fishnet_one_mi$fn_width <- 1
+fishnet_both_resolutions <- bind_rows(fishnet_half_mi, fishnet_one_mi)
+final_summary_shp <- left_join(fishnet_both_resolutions, final_summary_unitless, by=c('net_id', 'fn_width'))
+
+
+final_summary_csv <- final_summary_shp %>% 
+  st_centroid() %>%
+  st_transform(crs=WGS84) %>% 
+  mutate(
+    fishnet_centroid_lon=sf::st_coordinates(.)[,1],
+    fishnet_centroid_lat=sf::st_coordinates(.)[,2]) %>%
+  st_drop_geometry()
+```
+
+```{r write-census, eval=FALSE}
+st_write(final_summary_shp, '~/PredictAlign/PredictAlignFishnets/demographic_data_one_mile_and_half_mile_grids.shp')
+write.csv(final_summary_csv, '~/PredictAlign/PredictAlignFishnets/demographic_data_one_mile_and_half_mile_grids.csv')
+```
+
+```{r read-census}
+final_summary_shp <- st_read('~/PredictAlign/PredictAlignFishnets/demographic_data_one_mile_and_half_mile_grids.shp')
+final_summary_csv <- read.csv('~/PredictAlign/PredictAlignFishnets/demographic_data_one_mile_and_half_mile_grids.csv')
+```
+
+```{r check-fishnets}
+check_ids <- function(fn1, fn2, columns=c('net_id', 'geometry')){
+  intersect <- st_intersection(fn1[, columns], fn2[, columns])
+  intersect$area <- st_area(intersect) 
+  mismatch <- intersect %>%
+    filter(area > set_units(0, 'm2')) %>%
+    filter(net_id != net_id.1)
+  return(mismatch)
+}
+
+check1 <- check_ids(inc_fishnets_list[['2019_1']], inc_fishnets_list[['2018_1']])
+check2 <- check_ids(inc_fishnets_list[['2019_0.5']], inc_fishnets_list[['2018_0.5']])
+check1 <- check_ids(inc_fishnets_list[['2019_1']], inc_fishnets_list[['2018_1']])
+check1 <- check_ids(inc_fishnets_list[['2019_1']], inc_fishnets_list[['2018_1']])
+```

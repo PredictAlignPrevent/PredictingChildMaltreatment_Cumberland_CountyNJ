@@ -1,0 +1,192 @@
+---
+title: "Address Match Rate and Outcome Analysis"
+output:
+  html_document:
+    df_print: paged
+---
+  
+```{r setup, include=FALSE, warning=FALSE, messages=FALSE, echo=FALSE, cache=FALSE}
+knitr::opts_chunk$set(include=FALSE, warning=FALSE, 
+                      message=FALSE, echo=FALSE, cache=FALSE, fig.align="center")
+```
+
+```{r packages, message=FALSE, warning=FALSE, cache=FALSE, echo=FALSE}
+rm(list=ls())
+library("sf")            # Spatial data objects and methods
+library("mapview")       # Interactive Map Viewing
+library("ggmap")         # ggplot2 addon for base maps
+library("cowplot")
+library("spatstat")      # KDE and other spatial functions
+library("raster")        # cell-based spatial operations
+library("tidyverse")     # data manipulation framework
+library("Hmisc")         # using cut2() functions for ggplot legends
+library("hrbrthemes")
+library("gridExtra")
+library("knitr")         # for kable table
+library("viridis")
+library("viridisLite")
+library("readxl")
+library("spdep")
+library("tidycensus")
+library("tigris")
+library("lubridate")
+library("kableExtra")
+source('~/predict-align-prevent/R/fishnet.r')
+```
+
+```{r load-data, cache=TRUE}
+geocoded_incidents <- read.csv('~/PredictAlign/171819_NJ_geocoded_incidents.csv')
+```
+
+```{r prelim_clean, cache=TRUE}
+
+geocoded_incidents$intake_year <- as.character(sapply(geocoded_incidents$Intake.RcvdDate, lubridate::year))
+geocoded_incidents <- geocoded_incidents %>% filter(intake_year != '2020')
+
+unique(geocoded_incidents$Intake.Outcome)
+
+type_by_year <- geocoded_incidents %>% group_by(Intake.Algtn.Rqst, intake_year) %>% tally()
+g <- ggplot(type_by_year, aes(x=reorder(Intake.Algtn.Rqst, n), y=n, fill=intake_year)) + 
+  geom_bar(stat="identity", position=position_dodge()) + coord_flip()
+
+match_by_year <- tally_percent(geocoded_incidents, groupby=c('match_type', 'intake_year'), percentby=c('intake_year'))
+match_i_by_year <- tally_percent(geocoded_incidents, groupby=c('match_indicator', 'intake_year'), percentby=c('intake_year'))
+
+g1 <- ggplot(match_by_year, aes(x=intake_year, y=percent, fill=match_type)) + geom_bar(stat="identity", position="fill")
+
+g2 <- ggplot(match_i_by_year, aes(x=intake_year, y=percent, fill=match_indicator)) + geom_bar(stat="identity", position='fill')
+
+outcome_by_type <- geocoded_incidents %>% group_by(Intake.Algtn.Rqst, Intake.Outcome, intake_year) %>% tally()
+g3 <- ggplot(outcome_by_type, aes(x=reorder(Intake.Algtn.Rqst, n), y=n, fill=Intake.Outcome)) + 
+  geom_bar(stat="identity", position='fill') + facet_grid(.~intake_year) + coord_flip()
+
+#write.csv(outcome_by_type, '~/PredictAlign/maltreatment_allegation_outcome_year_summary.csv')
+```
+
+```{r cumberland_clean}
+
+# load and prep general purpose data
+nj <- load_neighborhood()
+cumberland <- extract_area(nj)
+geocoded_incidents_sf <- create_incidents_sf(geocoded_incidents)
+cumberland_incidents <- st_join(geocoded_incidents_sf, cumberland, join=st_within)
+cumberland_incidents_only <- cumberland_incidents %>% filter(COUNTY=='CUMBERLAND')
+
+type_by_year_cl <- cumberland_incidents_only %>% group_by(Intake.Algtn.Rqst, intake_year) %>% tally()
+ggplot(type_by_year_cl, aes(x=reorder(Intake.Algtn.Rqst, n), y=n, fill=intake_year)) + 
+  geom_bar(stat="identity", position=position_dodge()) + coord_flip()
+
+match_by_year <- tally_percent(as_tibble(cumberland_incidents_only), groupby=c('match_type', 'intake_year'), percentby=c('intake_year'))
+match_i_by_year <- tally_percent(as_tibble(cumberland_incidents_only), groupby=c('match_indicator', 'intake_year'), percentby=c('intake_year'))
+
+ggplot(match_by_year, aes(x=intake_year, y=percent, fill=match_type)) + geom_bar(stat="identity", position="fill")
+
+ggplot(match_i_by_year, aes(x=intake_year, y=percent, fill=match_indicator)) + geom_bar(stat="identity", position='fill')
+
+outcome_by_type_cl <- cumberland_incidents_only %>% group_by(Intake.Algtn.Rqst, Intake.Outcome, intake_year) %>% tally()
+ggplot(outcome_by_type_cl, aes(x=reorder(Intake.Algtn.Rqst, n), y=n, fill=Intake.Outcome)) + 
+  geom_bar(stat="identity", position='fill') + facet_grid(.~intake_year) + coord_flip()
+
+write.csv(outcome_by_type_cl, '~/PredictAlign/cumberland_county_maltreatment_allegation_outcome_year_summary.csv')
+```
+
+## Address match statistics, all maltreatment types and outcomes
+
+```{r cache = FALSE,echo=FALSE, warning=FALSE, include = TRUE, fig.width=11.5, fig.height=5}
+cowplot::plot_grid(g1, g2, align = "hv", axis = "lrbt")
+```
+
+## Intake counts by outcome, 2017-2019
+
+```{r cache = FALSE,echo=FALSE, warning=FALSE, include = TRUE, fig.width=11.5, fig.height=10}
+g3
+```
+
+```{r match-counts}
+# the full_addr column contains the incident address
+any_match <- geocoded_incidents %>% filter(match_indicator %in% c('Match', 'Tie'))
+address_counts <- tally_percent(any_match, groupby=c('full_addr', 'intake_year'), percentby=c('intake_year'))
+head(address_counts)
+
+high_counts <- address_counts %>% filter(count >= 25) %>% arrange(count)
+tail(high_counts, 20)
+unique(high_counts$full_addr)
+
+addr_types <- tibble(
+  full_addr=c('600 BROAD STREET, Newark, NJ', '1701 EAST BROAD STREET, Millville, NJ', '343 15TH AVENUE, Paterson, NJ',
+              '881 TONNELLE AVENUE, Jersey City, NJ', '881 TONNELE AVENUE, Jersey City, NJ'),
+  addr_type=c('emergency shelter', 'apartment_1', 'daycare',
+              'hotel_1', 'hotel_1')
+)
+
+addr_types_counts <- left_join(addr_types, address_counts, by='full_addr')
+g4 <- ggplot(addr_types_counts, aes(x=reorder(addr_type, -count), y=count, fill=intake_year)) + 
+  geom_bar(stat='identity')
+```
+
+## High frequency addresses
+
+Excluding outcomes "Not Established", "Unfounded" and NA.
+
+```{r cache = FALSE,echo=FALSE, warning=FALSE, include = TRUE, fig.width=11.5, fig.height=5}
+g4
+```
+
+## Total usable addresses
+
+### All counties
+
+```{r nj-counties, cache=TRUE}
+
+zero_pad <- function(n, digits=3){
+  if(!is.na(n)){
+    n_char <- as.character(n)
+    n_char <- unlist(strsplit(n_char, split=''))
+    while(length(n_char) < digits){
+      n_char <- c('0', n_char)
+    }
+    n_char <- paste(n_char, collapse='')
+    return(n_char)
+  }else{
+    return(NA)
+  }
+  
+}
+
+geocoded_incidents$correct_county_fips <- sapply(geocoded_incidents$county_fips, zero_pad)
+
+county_incident <- geocoded_incidents %>% group_by(correct_county_fips) %>% summarise(n=sum(n()))
+missing <- county_incident %>% filter(is.na(correct_county_fips))
+
+county_incident$fips <- paste('34', county_incident$correct_county_fips, sep='')
+
+nbr <- read_sf("https://opendata.arcgis.com/datasets/5f45e1ece6e14ef5866974a7b57d3b95_1.geojson") %>%  st_sf() 
+
+county_incident_shp <- st_transform(left_join(nbr, county_incident, by=c('FIPSSTCO'='fips')), crs=crs(nbr))
+
+nj_bbox <- unname(st_bbox(nbr))
+nj_base_map   <- get_stamenmap(bbox = nj_bbox, maptype = "toner")
+plot(nj_base_map)
+
+nj_counts <- ggmap(nj_base_map) + geom_sf(data=county_incident_shp, aes(fill=n), inherit.aes = FALSE)
+```
+
+```{r cache = FALSE,echo=FALSE, warning=FALSE, include = TRUE, fig.width=11.5, fig.height=5}
+nj_counts
+```
+
+```{r nj-summary, echo=FALSE, results='asis'}
+county_summary <- left_join(county_incident, nbr, by=c('fips'='FIPSSTCO')) %>%
+  select(COUNTY_LABEL, n) %>% 
+  #st_drop_geometry() %>%
+  group_by(COUNTY_LABEL) %>% summarise(total=sum(n))
+
+county_summary_final <- rbind(
+  county_summary,
+  c('Total', sum(county_summary$total))
+)
+```
+
+```{r count_table, include=TRUE, results='asis'}
+county_summary_final %>% kbl() %>% kable_styling()
+```

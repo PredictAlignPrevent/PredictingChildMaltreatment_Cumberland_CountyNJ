@@ -1,0 +1,338 @@
+---
+title: "Census Variables, Cumberland County, NJ Data Processing Workflow"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '6'
+  html_document:
+    toc: yes
+    theme: united
+    toc_depth: 6
+    toc_float: yes
+---
+
+```{r clean, include=FALSE}
+# a clean slate each time
+rm(list=ls())
+```
+
+```{r setup, include=TRUE, eval=TRUE, warning=FALSE, messages=FALSE, echo=FALSE, cache=FALSE}
+# default to suppress all code chunks unless explicitly indicated
+knitr::opts_chunk$set(include=TRUE, warning=FALSE, error=FALSE, results='hide',
+                      message=FALSE, echo=FALSE, cache=TRUE, fig.align="center")
+```
+
+# Risk and Protective Factor Data Processing Description
+
+We use half-mile and landscan to aggregate the geocoded risk and protective factor data. These aggregations are then used to contextualize child maltreatment risk in terms of these factors. 
+
+# Environment setup
+
+The following packages define the environment required for this workflow:
+
+```{r load-pkgs, include=TRUE, echo=TRUE}
+library("sf")            # Spatial data objects and methods
+library("ggmap")         # ggplot2 addon for base maps
+library("cowplot")
+library("raster")        # cell-based spatial operations
+library("tidyverse")     # data manipulation framework
+library("knitr")         # for kable table
+library("viridis")
+library("viridisLite")
+library("tidycensus")
+library("tigris")
+library("lubridate")
+library("readr")
+library("units")
+```
+
+As with the Model A pre-processing workflow, we load a series of helper functions, assign global variables, and load basemaps for plotting as part of our environment setup.
+
+```{r load-custom-fxns, eval=TRUE, include=TRUE, echo=TRUE}
+source('~/predict-align-prevent/R/sourcefiles/fishnet.r', local = knitr::knit_global())
+source('~/predict-align-prevent/R/sourcefiles/map_themes.r', local = knitr::knit_global())
+```
+
+```{r geometry-constants, include=TRUE, echo=TRUE}
+WGS84 = 4326
+NAD83 = 4269
+NJ_PLANAR = 'ESRI:102311'
+```
+
+```{r neighborhoods-basemaps, include=TRUE, echo=TRUE}
+# load and prep general purpose data
+nj <- load_neighborhood(
+  url='https://opendata.arcgis.com/datasets/5f45e1ece6e14ef5866974a7b57d3b95_1.geojson', 
+  crs=NJ_PLANAR
+  )
+cumberland <- extract_area(nj)
+cumberland_bm <- collect_basemap(cumberland, crs=WGS84)
+```
+
+# Load fishnets
+
+These fishnets were created during the pre-processing for Model A, but are not specific to that model type. We load a single shapefile containing fishnets for both the half-mile and landscan grids, and split the dataset into those respective grid dataframes.
+
+```{r save-halfmi-fishnet, eval=TRUE, include=TRUE, echo=TRUE}
+# .prj file shows correct projection, but crs(fishnet) does not
+# transform to be sure it's right
+fishnet <- st_read(
+  '~/PredictAlign/PredictAlignFishnets/cumberland_fishnets_urban_areas_with_landscan_NJ_PLANAR.shp'
+  ) 
+# fix names shortened by ESRI shapefile driver
+names(fishnet) <- c(  
+  'net_id', 'net_pop', 'year', 'fn_width', 'include_area',
+  'in_Commercial_Township', 'in_Bridgeton', 'in_Millville',
+  'in_Vineland', 'geometry')
+
+fishnet_half_mile <- fishnet %>% filter(fn_width=='0.5') %>% 
+  dplyr::select(-net_pop, -year) %>% 
+  distinct()
+fishnet_landscan <- fishnet %>% filter(fn_width=='landscan') %>% 
+  dplyr::select(-net_pop, -year) %>% 
+  distinct()
+```
+
+# Load census data
+
+Data were downloaded on April 14 2022 using command ` Rscript census_aggregato.r -k /Users/kpierce/CooksProTX/us_census_api_key.txt -s PAP-NJ/PAP-NJ-Variables -o /Users/kpierce/PredictAlign` to pull variables listed in the Google Drive sheet `PAP-NJ/PAP-NJ-Variables`. That sheet maps the column names in the file loaded below to alphanumeric data identifiers used by the US Census Bureau to label data.
+
+```{r census-load}
+census <- read.csv('~/PredictAlign/PAP-NJ-Variables_20220607190202.csv')
+census$GEOID <- as.character(census$GEOID)
+
+# tract level population data (just to get shapes)
+tract17 <- get_acs(
+    geography='tract',
+    variables='B01003_001',
+    state='NJ',
+    county='Cumberland',
+    year=2017,
+    survey='acs5',
+    show_call=TRUE,
+    geometry=TRUE
+  ) %>% st_transform(crs=NJ_PLANAR)
+
+tract18 <- get_acs(
+    geography='tract',
+    variables='B01003_001',
+    state='NJ',
+    county='Cumberland',
+    year=2018,
+    survey='acs5',
+    show_call=TRUE,
+    geometry=TRUE
+  ) %>% st_transform(crs=NJ_PLANAR)
+
+tract19 <- get_acs(
+    geography='tract',
+    variables='B01003_001',
+    state='NJ',
+    county='Cumberland',
+    year=2019,
+    survey='acs5',
+    show_call=TRUE,
+    geometry=TRUE
+  ) %>% st_transform(crs=NJ_PLANAR)
+
+tract17$year <- 2017
+tract18$year <- 2018
+tract19$year <- 2019
+tract_shapes <- bind_rows(tract17, tract18, tract19)
+
+census$GEOID <- as.character(census$GEOID)
+```
+
+# Merge census data and census tract shapes
+
+```{r}
+census_shapes <- left_join(
+  census,
+  tract_shapes,
+  on=c('GEOID', 'year')
+) %>% filter(grepl('Cumberland County', NAME)) %>%
+  st_as_sf(crs=NJ_PLANAR)
+
+census_shapes$block_area <- st_area(census_shapes)
+```
+
+# Calculate outstanding variables
+
+Some percentages must be calculated. We won't calculate population density here; we'll do that after rasterizing the population values.
+
+```{r}
+# Percent non-white
+census_shapes$EP_NON_WHITE <- census_shapes$E_NON_WHITE / census_shapes$E_TOTPOP
+
+# Percent non-married
+census_shapes$EP_NON_MARRIED <- (census_shapes$E_HH - census_shapes$E_HH_MARRIED) / census_shapes$E_HH
+
+# Select final variables
+census_shapes_pct <- census_shapes %>% 
+  select(GEOID, year, E_TOTPOP, EP_BLACK, EP_NON_WHITE, EP_HISPANIC_LATINO, EP_AGE17, EP_COLLEGE_ED,
+         EP_NOHSDP, EP_POV, EP_SNGPNT, EP_HH_FEMALE_HEADED, EP_NON_MARRIED, EP_PUBLIC_INSURANCE,
+         EP_UNINSUR, EP_HU_OWNER_OCCUPIED, EP_RENTER_OCCUPIED, geometry, block_area)
+```
+
+# Rasterize variables
+
+```{r, eval=FALSE}
+variables <- names(census_shapes_pct)[grepl('EP_', names(census_shapes_pct))]
+
+years <- 2017:2019
+variable_fishnets_list = list() # for storing variable fishnets
+for(i in seq_along(years)){
+  # filter referrals by year
+  year_census <- census_shapes_pct %>% filter(year==years[i])
+  for(j in seq_along(variables)){  # population fishnet
+    print(
+      paste("Processing year", years[i], "and variable", variables[j], sep=' ')
+      )
+    year_census_var <- year_census %>%
+      select(GEOID, block_area, variables[j]) %>%
+      rename('estimate' = variables[j])
+    pop_net <- create_population_fishnet(
+      pop_data=year_census_var, 
+      cover_area=cumberland, 
+      fishnet_size=0.5, 
+      fishnet_units='mi'
+      )
+    net_name <- paste(years[i], variables[j], sep='_')
+    variable_fishnets_list[[net_name]] <- pop_net
+  }
+}
+```
+
+That took about 2h, let's save the list of rasterized census data...
+
+```{r}
+saveRDS(variable_fishnets_list, '~/PredictAlign/census_variable_fishnets_june2022.rds')
+```
+
+```{r}
+rasters2017 <- list()
+rasters2018 <- list()
+rasters2019 <- list()
+for(l in seq_along(variable_fishnets_list)){
+  indicators <- unlist(strsplit(names(variable_fishnets_list)[l], split='_'))
+  varname <- paste(indicators[2:length(indicators)], collapse='_')
+  print(varname)
+  data_item <- variable_fishnets_list[[l]]
+  names(data_item)[names(data_item) == 'net_pop'] <- varname
+  data_item <- data_item %>% select(-unitless_net_pop)
+  if(indicators[1] == '2017'){
+    rasters2017[[varname]]  <- data_item
+  }else if(indicators[1] == '2018'){
+    rasters2018[[varname]]  <- data_item
+  }else if(indicators[1] == '2019'){
+    rasters2019[[varname]]  <- data_item
+  }
+}
+
+all2017 <- rasters2017[[1]]
+for(i in 2:length(rasters2017)){
+  joindata <- rasters2017[[i]] %>% st_drop_geometry()
+  all2017 <- left_join(all2017, joindata, on='net_id')
+}
+all2017$year <- 2017
+
+all2018 <- rasters2018[[1]]
+for(i in 2:length(rasters2018)){
+  joindata <- rasters2018[[i]] %>% st_drop_geometry()
+  all2018 <- left_join(all2018, joindata, on='net_id')
+}
+all2018$year <- 2018
+
+all2019 <- rasters2019[[1]]
+for(i in 2:length(rasters2019)){
+  joindata <- rasters2019[[i]] %>% st_drop_geometry()
+  all2019 <- left_join(all2019, joindata, on='net_id')
+}
+all2019$year <- 2019
+
+all_census_rasters <- bind_rows(all2017, all2018, all2019)
+write.csv(
+  (all_census_rasters %>% st_drop_geometry()),
+  '~/PredictAlign/census_variable_fishnets_half_mi_ESRI_102311.csv')
+st_write(all_census_rasters, '~/PredictAlign/census_variable_fishnets_half_mi_ESRI_102311.shp')
+```
+
+# Do it all again for the landscan fishnet
+
+```{r, eval=FALSE}
+# same as create_population_fishnet(), just picks up at the `net_agg` step, where
+# the landscan fishnet serves as the `net_agg` fishnet grid object
+create_population_fishnet_landscan <- function(pop_data, net_agg, cover_area, fishnet_size, fishnet_units='mi'){
+  
+  # list of net cells IDs that intersect with the cover area (if cover area is irregular)
+  print('Intersecting fishnet with population data.')
+  net_intersect <- st_intersects(cover_area, net_agg) 
+  net_cover_area <- net_agg[unique(unlist(net_intersect)),]
+  net_cover_area$net_area <- st_area(net_cover_area)
+  net_blocks_intersect <- st_intersection(pop_data, net_cover_area)
+  print(paste('Dimensions of intersection data', 
+              dim(net_blocks_intersect), sep=': '))
+  
+  # group by fishnet cell and calc block stats.
+  print('Calculating block and fishnet intersection areas.')
+  net_blocks_intersect <- net_blocks_intersect %>%
+    # calculate the area of each tract/fishet intersection
+    mutate(intersect_area = st_area(net_blocks_intersect) ) %>%
+    # group by the fishnet ID
+    group_by(net_id) %>%
+    # calculate the fraction of each block group covered by a fishnet cell
+    # then assume the population is proportional to the overlap area
+    mutate(
+      cnt = n(), 
+      pcnt_of_block = intersect_area/block_area, 
+      intersect_pop = estimate * pcnt_of_block) %>%
+    arrange(net_id)
+  
+  print('Summarizing fishnet population sizes.')
+  fishnet_pop <- net_blocks_intersect %>%
+    group_by(net_id) %>%
+    summarise(net_pop = sum(intersect_pop)) 
+  
+  # drop units (required for plotting)
+  fishnet_pop$unitless_net_pop <- units::drop_units(fishnet_pop$net_pop)
+  
+  return(fishnet_pop)
+}
+
+census2019 <- census_shapes %>% filter(year==2019)
+variable_fishnets_list_landscan <- list()
+for(j in seq_along(variables)){  # population fishnet
+  print(
+    paste("Processing 2019 variable", variables[j], sep=' ')
+    )
+  census2019_var <- census2019 %>%
+    select(GEOID, block_area, variables[j]) %>%
+    rename('estimate' = variables[j])
+  pop_net <- create_population_fishnet_landscan(
+    pop_data=census2019_var,
+    net_agg=fishnet_landscan,
+    cover_area=cumberland, 
+    fishnet_size=0.5, 
+    fishnet_units='mi'
+    )
+  net_name <- variables[j]
+  variable_fishnets_list_landscan[[net_name]] <- pop_net
+}
+
+# grab just the net_id and geometry columns
+all_landscan_census <- variable_fishnets_list_landscan[[1]] %>%
+  select(net_id, geometry)
+for(l in seq_along(variable_fishnets_list_landscan)){
+  # grab the data and rename the `net_pop` column to the variable name
+  data_item <- variable_fishnets_list_landscan[[l]]
+  names(data_item)[names(data_item) == 'net_pop'] <- names(variable_fishnets_list_landscan)[l]
+  data_item <- data_item %>% select(-unitless_net_pop) %>% st_drop_geometry()
+  all_landscan_census <- left_join(all_landscan_census, data_item, on='net_id')
+}
+ 
+all_landscan_census$year <- 2019
+write.csv((all_landscan_census %>% st_drop_geometry()),
+          '~/PredictAlign/census_variable_fishnets_landscan_ESRI_102311.csv')
+st_write(all_landscan_census, '~/PredictAlign/census_variable_fishnets_landscan_ESRI_102311.shp')
+
+```

@@ -1,0 +1,1435 @@
+---
+title: "Risk and Protective Factors, Cumberland County, NJ Data Processing Workflow"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '6'
+  html_document:
+    toc: yes
+    theme: united
+    toc_depth: 6
+    toc_float: yes
+---
+
+```{r clean, include=FALSE}
+# a clean slate each time
+rm(list=ls())
+```
+
+```{r setup, include=TRUE, eval=TRUE, warning=FALSE, messages=FALSE, echo=FALSE, cache=FALSE}
+# default to suppress all code chunks unless explicitly indicated
+knitr::opts_chunk$set(include=TRUE, warning=FALSE, error=FALSE, results='hide',
+                      message=FALSE, echo=FALSE, cache=TRUE, fig.align="center")
+```
+
+# Risk and Protective Factor Data Processing Description
+
+We use half-mile and landscan to aggregate the geocoded risk and protective factor data. These aggregations are then used to contextualize child maltreatment risk in terms of these factors. 
+# Environment setup
+
+The following packages define the environment required for this workflow:
+
+```{r load-pkgs, include=TRUE, echo=TRUE}
+library("sf")            # Spatial data objects and methods
+library("ggmap")         # ggplot2 addon for base maps
+library("cowplot")
+library("raster")        # cell-based spatial operations
+library("tidyverse")     # data manipulation framework
+library("knitr")         # for kable table
+library("viridis")
+library("viridisLite")
+library("tidycensus")
+library("tigris")
+library("lubridate")
+library("readr")
+library("units")
+```
+
+As with the Model A pre-processing workflow, we load a series of helper functions, assign global variables, and load basemaps for plotting as part of our environment setup.
+
+```{r load-custom-fxns, eval=TRUE, include=TRUE, echo=TRUE}
+source('~/predict-align-prevent/R/sourcefiles/fishnet.r', local = knitr::knit_global())
+source('~/predict-align-prevent/R/sourcefiles/map_themes.r', local = knitr::knit_global())
+```
+
+```{r geometry-constants, include=TRUE, echo=TRUE}
+WGS84 = 4326
+NAD83 = 4269
+NJ_PLANAR = 'ESRI:102311'
+```
+
+```{r neighborhoods-basemaps, include=TRUE, echo=TRUE}
+# load and prep general purpose data
+nj <- load_neighborhood(
+  url='https://opendata.arcgis.com/datasets/5f45e1ece6e14ef5866974a7b57d3b95_1.geojson', 
+  crs=NJ_PLANAR
+  )
+cumberland <- extract_area(nj)
+cumberland_bm <- collect_basemap(cumberland, crs=WGS84)
+```
+
+# Load fishnets
+
+These fishnets were created during the pre-processing for Model A, but are not specific to that model type. We load a single shapefile containing fishnets for both the half-mile and landscan grids, and split the dataset into those respective grid dataframes.
+
+```{r save-halfmi-fishnet, eval=TRUE, include=TRUE, echo=TRUE}
+# .prj file shows correct projection, but crs(fishnet) does not
+# transform to be sure it's right
+fishnet <- st_read(
+  '~/PredictAlign/PredictAlignFishnets/cumberland_fishnets_urban_areas_with_landscan_NJ_PLANAR.shp'
+  ) 
+# fix names shortened by ESRI shapefile driver
+names(fishnet) <- c(  
+  'net_id', 'net_pop', 'year', 'fn_width', 'include_area',
+  'in_Commercial_Township', 'in_Bridgeton', 'in_Millville',
+  'in_Vineland', 'geometry')
+
+fishnet_half_mile <- fishnet %>% filter(fn_width=='0.5') %>% 
+  dplyr::select(-net_pop, -year) %>% 
+  distinct()
+fishnet_landscan <- fishnet %>% filter(fn_width=='landscan') %>% 
+  dplyr::select(-net_pop, -year) %>% 
+  distinct()
+```
+
+# Load risk and protective data
+
+Load the crime, violations, and risk/protective factors data.
+
+```{r load-risk-protect, eval=TRUE, include=TRUE, echo=TRUE}
+geocoded_crime <- read.csv(
+  '~/PredictAlign/RiskProtectiveGeocoded/bridgeton_police_data_unique_addresses_geocoded.csv'
+  )
+bridgeton_crime <- read.csv(
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/Bridgeton_Crime_all.csv'
+  )
+mv_viol <- read.csv(
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/Millville_violation_100.csv'
+  )
+bt_viol <- read.csv(
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/bridgeton_violation_100.csv'
+  )
+cumberland_risk_protective2 <- read.csv(
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/risk_protect_factors.csv'
+  )
+st_pol <- read.csv(
+  '~/PredictAlign/2020Jul28_St_Pol_Jul19_Jun20_PAP_Police_Variables-tacc-no-filters.csv'
+  )
+mv_vl_st_pol <- read.csv(
+  '~/PredictAlign/MILLVILLE_VINELAND_GEOCODED_2020Jul28_St_Pol_Jul19_Jun20_PAP_Police_Variables-tacc-no-filters.csv'
+  )
+mv_rent <- read.csv(
+  '~/PredictAlign/2020Jul28_Millville_Failed_Rental_Inspections_Geocoded.csv'
+)
+```
+
+Load the geocoded data for unique addresses in the risk/protective datasets.
+
+```{r load-geocodes, eval=TRUE, include=TRUE, echo=TRUE}
+mv_viol_gc <- read.csv(
+  '~/PredictAlign/RiskProtectiveGeocoded/unique_geocoded_addresses/2020Jul22_Millville_Code_Enforcement_1-4_geocoded.csv'
+  )
+bt_viol_gc <- read.csv('~/PredictAlign/RiskProtectiveGeocoded/unique_geocoded_addresses/2020Jul22_Bridgeton_Violations_geocoded.csv')
+```
+
+# Grid aggregation for risk and protective factors
+
+First, we calculate the centroids of each fishnet cell.
+
+```{r fishnet-centroids, eval=TRUE, include=TRUE, echo=TRUE}
+fn05_centroid <- fishnet %>%
+  filter(fn_width=='0.5') %>%
+  select(net_id, year, fn_width, include_area, net_pop) %>%
+  st_centroid() %>%
+  mutate(
+    fishnet_centroid_lon=sf::st_coordinates(.)[,1], 
+    fishnet_centroid_lat=sf::st_coordinates(.)[,2]) %>%
+  st_drop_geometry() %>%
+  distinct()
+
+fnls_centroid <- fishnet %>%
+  filter(fn_width=='landscan') %>%
+  select(net_id, year, fn_width, include_area, net_pop) %>%
+  st_centroid() %>%
+  mutate(
+    fishnet_centroid_lon=sf::st_coordinates(.)[,1], 
+    fishnet_centroid_lat=sf::st_coordinates(.)[,2]) %>%
+  st_drop_geometry() %>%
+  distinct()
+```
+
+Second, we apply half-mile or landscan fishnets to each risk or protective factor dataset. The result is that each incident of crime or protective location is assigned the a grid cell number; these grid cell numbers correspond to the grid cells used to aggregate maltreatment data for both Model A and Model B. Note that columns must be `lat` and `lon` (not `long`).
+
+We transform the coordinate reference system for each dataset to the New Jersey State Planar CRS, and save the resulting gridded data in that format.
+
+## Bridgeton crime data
+
+The Bridgeton crime dataset contains crime observations from across the state of New Jersey, not only within the Bridgeton municipality. We will sort the input and matched address by city (in Bridgeton or not) and map the results to check that the geocodes makes sense.
+
+```{r bridgeton-sf, eval=TRUE, include=TRUE}
+# there are NAs for match indicator in this dataset because early geocode
+# runs didn't return full output
+geocoded_crime <- geocoded_crime %>% mutate(
+  correct_match_indicator = if_else((!is.na(long)), 'Match', 'No_Match')
+)
+
+geocoded_crime %>% group_by(correct_match_indicator) %>% summarise(n=n())
+
+bridgeton_crime_geocoded <- left_join(bridgeton_crime, geocoded_crime, by='Incident.Location') %>% mutate(
+    year=as.character(
+      lubridate::year(
+        readr::parse_datetime(Report.Date...Time, "%m/%d/%Y %H:%M")
+        )
+    )
+  )
+bridgeton_crime_geocoded <- bridgeton_crime_geocoded %>% mutate(
+  correct_match_indicator = if_else(
+    (is.na(correct_match_indicator)), 'No_Match', 'Match')
+)
+
+bc_match_summary <- bridgeton_crime_geocoded %>% 
+  group_by(correct_match_indicator, year) %>% 
+  summarise(n=n())
+
+bridgeton_crime_geocoded_match <- bridgeton_crime_geocoded %>% drop_na(lat, long)
+names(bridgeton_crime_geocoded_match)[names(bridgeton_crime_geocoded_match) == 'long'] <- 'lon'
+
+bridgeton_crime_sf <- create_incidents_sf(
+  bridgeton_crime_geocoded_match, initial_crs=NAD83, transform_crs=NJ_PLANAR
+  )
+```
+
+Bridgeton crime by in/outside of Bridgeton (according to input and matched address).
+
+```{r bridgeton-sanity, eval=TRUE, include=TRUE, cache=TRUE}
+nj <- load_neighborhood(
+  url='https://opendata.arcgis.com/datasets/5f45e1ece6e14ef5866974a7b57d3b95_1.geojson', 
+  crs=NJ_PLANAR)
+cumberland <- extract_area(nj)
+#nj_bm <- collect_basemap(nj, crs=WGS84)
+cumberland_bm <- collect_basemap(cumberland, crs=WGS84)
+
+municipalities <- st_read(
+  '~/PredictAlign/Municipal_Boundaries_of_NJ/Municipal_Boundaries_of_NJ.shp'
+  )
+municipality_names <- c("Commercial Township", "Bridgeton", "Millville", "Vineland")
+cumberland_cities <- municipalities %>% 
+  filter(NAME %in% municipality_names) %>% 
+  st_transform(crs=crs(fishnet_half_mile))
+
+ct_boundary = cumberland_cities %>% filter(NAME == "Commercial Township")
+bt_boundary = cumberland_cities %>% filter(NAME == "Bridgeton")
+mv_boundary = cumberland_cities %>% filter(NAME == "Millville")
+vl_boundary = cumberland_cities %>% filter(NAME == "Vineland")
+
+ct_grid_boundary = fishnet_half_mile %>% 
+  filter(in_Commercial_Township==TRUE) %>%
+  st_union()
+bt_grid_boundary = fishnet_half_mile %>% 
+  filter(in_Bridgeton==TRUE) %>%
+  st_union()
+mv_grid_boundary = fishnet_half_mile %>% 
+  filter(in_Millville==TRUE) %>%
+  st_union()
+vl_grid_boundary = fishnet_half_mile %>% 
+  filter(in_Vineland==TRUE) %>%
+  st_union()
+
+ct_ls_boundary = fishnet_landscan %>% 
+  filter(in_Commercial_Township==TRUE) %>%
+  st_union()
+bt_ls_boundary = fishnet_landscan %>% 
+  filter(in_Bridgeton==TRUE) %>%
+  st_union()
+mv_ls_boundary = fishnet_landscan %>% 
+  filter(in_Millville==TRUE) %>%
+  st_union()
+vl_ls_boundary = fishnet_landscan %>% 
+  filter(in_Vineland==TRUE) %>%
+  st_union()
+
+all_grid_boundary = st_union(c(ct_grid_boundary, bt_grid_boundary,
+                              mv_grid_boundary, vl_grid_boundary))
+all_ls_boundary = st_union(c(ct_ls_boundary, bt_ls_boundary,
+                              mv_ls_boundary, vl_ls_boundary))
+map_all <- ggmap(cumberland_bm) +
+  geom_sf(data=st_transform(all_grid_boundary, crs=WGS84), inherit.aes=FALSE)
+
+#check_input <- ggmap(nj_bm) + 
+#  geom_sf(data=st_transform(cumberland, crs=WGS84), 
+#          inherit.aes = FALSE, color='blue', alpha = 0.1) +
+#  geom_sf(data=st_transform(bridgeton_crime_sf, crs=WGS84), 
+#          aes(color=in_bridgeton_input), inherit.aes = FALSE)
+#check_match <- ggmap(nj_bm) + 
+#  geom_sf(data=st_transform(cumberland, crs=WGS84), 
+#          inherit.aes = FALSE, color='blue', alpha = 0.1) +
+#  geom_sf(data=st_transform(bridgeton_crime_sf, crs=WGS84), 
+#          aes(color=in_bridgeton_match), inherit.aes = FALSE)
+#cowplot::plot_grid(check_input, check_match, nrow=1)
+```
+
+There are a couple of addresses with "Bridgeton" as the city that don't appear to actually be in Bridgeton. The coordinates for addresses on Cornell Avenue, however, do show up as Bridgeton addresses when manually checked in Google Maps. The coordinates for the New Street address geolocate to Maurice River, NJ. That address will be excluded due to the improper geocode.
+
+```{r filter-bt, eval=TRUE, include=TRUE}
+not_quite_bt <- bridgeton_crime_sf %>% filter(in_bridgeton_input == TRUE & in_bridgeton_match == TRUE) %>% st_transform(crs=WGS84) %>% st_crop(xmax=-73, xmin=-76, ymax=39.25, ymin=38)
+
+bridgeton_crime_sf_final <- bridgeton_crime_sf %>% 
+  filter(PD.Case..!='17-15137' & year %in% c(2017:2019))
+
+bridgeton_crime_sf_final_grid <- st_intersection(bridgeton_crime_sf_final, bt_grid_boundary)
+bridgeton_crime_sf_final_ls <- st_intersection(bridgeton_crime_sf_final, bt_ls_boundary)
+
+in_bt_grid_raster <- bridgeton_crime_sf_final_grid %>%
+  group_by(year) %>% 
+  summarise(n=n()) %>% 
+  mutate(correct_match_indicator = 'Match') %>%
+  st_drop_geometry() %>%
+  rename('n_bt_raster'=n) %>%
+  mutate(fishnet_width = 'half mile')
+bt_crime_summary <- bc_match_summary %>% 
+  pivot_wider(id_cols=c('year'), names_from='correct_match_indicator',
+              values_from='n') %>%
+  left_join(in_bt_grid_raster, on=c('year')) %>%
+  filter(year != 2020) %>% select(-correct_match_indicator)
+
+in_bt_ls_raster <- bridgeton_crime_sf_final_ls %>%
+  group_by(year) %>% 
+  summarise(n=n()) %>% 
+  mutate(correct_match_indicator = 'Match') %>%
+  st_drop_geometry() %>%
+  rename('n_bt_raster'=n) %>%
+  filter(year==2019) %>%
+  mutate(fishnet_width = 'landscan')
+bt_crime_summary_ls <- bc_match_summary %>% 
+  pivot_wider(id_cols=c('year'), names_from='correct_match_indicator',
+              values_from='n') %>%
+  left_join(in_bt_ls_raster, on=c('year')) %>%
+  filter(year != 2020) %>% select(-correct_match_indicator)
+
+bt_crime_summary_raster <- bind_rows(bt_crime_summary, bt_crime_summary_ls) %>%
+  drop_na() %>% rename('final n'=n_bt_raster) %>%
+  rename('geocode match'=Match) %>% rename('no geocode match'=No_Match) %>%
+  rename('fishnet width'=fishnet_width) %>%
+  mutate(`outside Bridgeton` = `geocode match` - `final n`) %>%
+  select(`fishnet width`, year, `geocode match`, 
+         `no geocode match`, `outside Bridgeton`, `final n`)
+kable(bt_crime_summary_raster)
+
+write.csv(bt_crime_summary_raster, '~/PredictAlign/final_bridgeton_crime_count_summary.csv')
+```
+
+Now we finalize the Bridgeton data by adding in the fishnet grids.
+
+```{r bridgeton-crime, eval=TRUE, include=TRUE, echo=TRUE}
+bridgeton_crime_fishnet_half_mi <- apply_fishnet(
+  bridgeton_crime_sf_final_grid, fishnet_half_mile, fn05_centroid, crs=NJ_PLANAR
+  )
+bridgeton_crime_fishnet_half_mi <- bridgeton_crime_fishnet_half_mi %>% 
+  filter(year %in% c(2017:2019))
+
+bridgeton_crime_fishnet_landscan <- apply_fishnet(
+  bridgeton_crime_sf_final_ls, fishnet_landscan, fnls_centroid, crs=NJ_PLANAR
+  )
+bridgeton_crime_fishnet_landscan <- bridgeton_crime_fishnet_landscan %>% 
+  filter(year == 2019)
+
+bridgeton_crime_fishnet_final <- bind_rows(
+  bridgeton_crime_fishnet_half_mi,
+  bridgeton_crime_fishnet_landscan
+  ) %>%
+  select(Report.Date...Time, year, PD.Case.., Incident.Location, 
+         Agency.Incident...Actual.CFS.Type, crime_type,
+         Address, City, State.Zip,
+         net_id, net_pop, include_area, in_Commercial_Township,
+         in_Bridgeton, in_Millville, in_Vineland, fn_width,
+         data_lon, data_lat, fishnet_centroid_lon, 
+         fishnet_centroid_lat)
+```
+
+We are able to keep the following observations from the Bridgeton crime dataset, removing any observations that did not have "Bridgeton" (or some derivative spelling) in the provided address *and* in the matched address. The observations that do not geocode to within the boundaries of Bridgeton are also excluded. We also double check that the fishnet conversion preserved the correct counts.
+
+```{r bt_table, results='markup', echo=TRUE, cache=TRUE}
+bt_summary <- bridgeton_crime_fishnet_final %>% 
+  group_by(fn_width, include_area, year) %>% 
+  summarise(n=n()) %>% 
+  pivot_wider(id_cols=c(fn_width, year), names_from = c(include_area), values_from = c(n))
+
+kable(bt_summary, caption="Bridgeton crime data by year and grid resolution.")
+kable(bt_crime_summary_raster, caption="Rasterized Bridgeton crime data.")
+```
+
+```{r bcrime_map}
+bc_sf <- st_as_sf(
+  x=bridgeton_crime_fishnet_final, 
+  crs=crs(fishnet_half_mile),
+  coords=c('data_lon', 'data_lat')
+  )
+
+urban_map <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(fishnet_half_mile, crs=WGS84), 
+    inherit.aes = FALSE, color = NA, alpha = 0.8
+    ) +
+  geom_sf(
+    data=st_transform(fishnet_landscan, crs=WGS84), 
+    inherit.aes = FALSE, color = NA, alpha = 0.8
+    ) +
+  geom_sf(data=st_transform(cumberland_cities, crs=WGS84), aes(size=0.75), color='black', inherit.aes=FALSE, alpha=0) +
+  geom_sf(data=st_transform(bc_sf, crs=WGS84), inherit.aes=FALSE, ) +
+  facet_grid(~fn_width) +
+  scale_size_identity()
+  
+urban_map
+```
+
+```{r write-btcrime, eval=FALSE}
+write.csv(
+  bridgeton_crime_fishnet_final,
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/Bridgeton_Crime_all_geocoded_with_netid_nj_planar_esri_102311.csv',
+  quote=TRUE
+  )
+```
+
+## Millville code enforcement data
+
+```{r millvile-violations, include=TRUE, echo=TRUE, cache=TRUE}
+mv_viol_gc %>% group_by(X, X.3, match_indicator) %>% summarise(n=n())
+
+# remove trailing whitespace in mv_viol address column
+mv_viol$clean_addr <- str_trim(mv_viol$Property.Location, side=c('right'))
+mv_viol_gc_combined <- left_join(
+  mv_viol, mv_viol_gc, by=c("clean_addr"="input_address")) %>%
+  mutate(correct_match_indicator = if_else(
+    (is.na(match_indicator)), 'No_Match', 'Match')) %>%
+  mutate(year=as.character(lubridate::year(Violation.Date)))
+
+mv_viol_matches <- mv_viol_gc_combined %>% 
+  group_by(year, correct_match_indicator) %>% 
+  summarise(n=n()) %>%
+  pivot_wider(id_cols='year', names_from='correct_match_indicator', values_from='n')
+
+no_match_unique <- mv_viol_gc_combined %>%
+  filter(correct_match_indicator=='No_Match') %>%
+  select(year, Property.Location) %>%
+  distinct() %>%
+  group_by(year) %>%
+  summarise(n=n())
+
+mv_viol_sf <- create_incidents_sf(
+  mv_viol_gc_combined, initial_crs=NAD83, transform_crs=NJ_PLANAR
+  )
+
+mv_viol_sf_grid <- st_intersection(mv_viol_sf, mv_grid_boundary)
+mv_viol_sf_ls <- st_intersection(mv_viol_sf, mv_ls_boundary)
+
+in_mv_grid_raster <- mv_viol_sf_grid %>%
+  group_by(year) %>% 
+  summarise(n=n()) %>% 
+  mutate(correct_match_indicator = 'Match') %>%
+  st_drop_geometry() %>%
+  rename('n_mv_raster'=n) %>%
+  mutate(fishnet_width = 'half mile')
+
+mv_crime_summary <- mv_viol_matches %>% 
+  left_join(in_mv_grid_raster, on=c('year')) %>%
+  filter(year != 2020) %>% select(-correct_match_indicator)
+
+in_mv_ls_raster <- mv_viol_sf_ls %>%
+  group_by(year) %>% 
+  summarise(n=n()) %>% 
+  mutate(correct_match_indicator = 'Match') %>%
+  st_drop_geometry() %>%
+  rename('n_mv_raster'=n) %>%
+  filter(year==2019) %>%
+  mutate(fishnet_width = 'landscan')
+mv_crime_summary_ls <- mv_viol_matches %>% 
+  left_join(in_mv_ls_raster, on=c('year')) %>%
+  filter(year != 2020) %>% select(-correct_match_indicator)
+
+mv_viol_summary_raster <- bind_rows(mv_crime_summary, mv_crime_summary_ls) %>%
+  drop_na() %>% rename('final n'=n_mv_raster) %>%
+  rename('geocode match'=Match) %>% rename('no geocode match'=No_Match) %>%
+  rename('fishnet width'=fishnet_width) %>%
+  mutate(`outside Millville` = `geocode match` - `final n`) %>%
+  select(`fishnet width`, year, `geocode match`, 
+         `no geocode match`, `outside Millville`, `final n`)
+kable(mv_viol_summary_raster)
+
+write.csv(mv_viol_summary_raster, '~/PredictAlign/final_millville_violation_count_summary.csv')
+
+mv_viol_check <- ggmap(cumberland_bm) +
+  geom_sf(data=st_transform(mv_viol_sf_grid, crs=WGS84), inherit.aes=FALSE) +
+  geom_sf(data=st_transform(mv_grid_boundary, crs=WGS84), 
+          inherit.aes = FALSE, color='blue', alpha = 0.1)
+mv_viol_check
+
+mv_viol_fishnet_half_mi <- apply_fishnet(
+  mv_viol_sf_grid, fishnet_half_mile, fn05_centroid, crs=NJ_PLANAR
+  )
+mv_viol_fishnet_half_mi <- mv_viol_fishnet_half_mi %>% 
+  filter(year %in% c(2017:2019))
+
+mv_viol_fishnet_ls <- apply_fishnet(
+  mv_viol_sf_ls, fishnet_landscan, fnls_centroid, crs=NJ_PLANAR
+  )
+mv_viol_fishnet_ls <- mv_viol_fishnet_ls %>% filter(year == 2019)
+
+mv_viol_fishnet_final <- bind_rows(
+  mv_viol_fishnet_half_mi, mv_viol_fishnet_ls
+  ) %>%
+  select(Violation.Id, Block.Lot.Qual, Property.Location, Property.Class,
+         Ordinance.Id.1, Compliance.Date.1, Ordinance.1.Conditions,
+         Violation.Date, year,
+         Status, Status.Date, Description, Conditions, violation_type,
+         clean_addr,
+         matched_address, net_id, net_pop, include_area, fn_width,
+         in_Commercial_Township, in_Bridgeton, in_Millville, in_Vineland,
+         data_lon, data_lat, fishnet_centroid_lon, fishnet_centroid_lat)
+```
+
+We are able to keep the following observations from the Millville code enforcement dataset, excluding values that did not geocode within the municipal boundaries of Millville:
+```{r mv_table, results='markup', echo=TRUE, cache=TRUE}
+mv_summary <- mv_viol_fishnet_final %>% 
+  group_by(fn_width, year) %>% 
+  summarise(n=n()) %>% rename('include'=n)
+
+kable(mv_summary, caption="Millville code enforcement data by year.")
+kable(mv_viol_summary_raster)
+```
+
+```{r write-mvviol, eval=FALSE}
+write.csv(
+  mv_viol_fishnet_final,
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/Millville_violations_all_geocoded_with_netid_nj_planar_esri_102311.csv',
+  quote=TRUE
+)
+```
+
+## Millville rental inspection data
+
+```{r mvrent}
+mv_rent %>% group_by(state_fips, county_fips) %>% summarise(n=n())
+# the 702 records w/o geocodes represent only 77 unique addresses
+unmatched <- unique((mv_rent %>% filter(match_indicator=='No_Match'))$input_address)
+
+mv_rent <- mv_rent %>% rename('lon' = long) %>%
+  mutate(year=as.character(lubridate::year(Activity.Date))) %>%
+  mutate(correct_match_indicator = if_else(
+    (match_indicator == 'Match'), 'Match', 'No_Match')
+  )
+
+mv_rent_matches <- mv_rent %>% 
+  group_by(year, correct_match_indicator) %>% 
+  summarise(n=n()) %>%
+  pivot_wider(id_cols='year', names_from='correct_match_indicator', values_from='n')
+
+mv_rent_sf <- create_incidents_sf(
+  mv_rent, initial_crs=NAD83, transform_crs=NJ_PLANAR
+  )
+mv_rent_sf_grid <- st_intersection(mv_rent_sf, mv_grid_boundary)
+mv_rent_sf_ls <- st_intersection(mv_rent_sf, mv_ls_boundary)
+
+in_mv_rent_grid_raster <- mv_rent_sf_grid %>%
+  group_by(year) %>% 
+  summarise(n=n()) %>% 
+  mutate(correct_match_indicator = 'Match') %>%
+  st_drop_geometry() %>%
+  rename('n_mv_raster'=n) %>%
+  mutate(fishnet_width = 'half mile')
+mv_rent_summary <- mv_rent_matches %>% 
+  left_join(in_mv_rent_grid_raster, on=c('year')) %>%
+  filter(year != 2020) %>% select(-correct_match_indicator)
+
+in_mv_rent_ls_raster <- mv_rent_sf_ls %>%
+  group_by(year) %>% 
+  summarise(n=n()) %>% 
+  mutate(correct_match_indicator = 'Match') %>%
+  st_drop_geometry() %>%
+  rename('n_mv_raster'=n) %>%
+  filter(year==2019) %>%
+  mutate(fishnet_width = 'landscan')
+mv_rent_summary_ls <- mv_rent_matches %>% 
+  left_join(in_mv_rent_ls_raster, on=c('year')) %>%
+  filter(year != 2020) %>% select(-correct_match_indicator)
+
+mv_rent_summary_raster <- bind_rows(mv_rent_summary, mv_rent_summary_ls) %>%
+  drop_na() %>% rename('final n'=n_mv_raster) %>%
+  rename('geocode match'=Match) %>% rename('no geocode match'=No_Match) %>%
+  rename('fishnet width'=fishnet_width) %>%
+  mutate(`outside Millville` = `geocode match` - `final n`) %>%
+  select(`fishnet width`, year, `geocode match`, 
+         `no geocode match`, `outside Millville`, `final n`)
+kable(mv_rent_summary_raster)
+
+write.csv(mv_rent_summary_raster, '~/PredictAlign/final_millville_rental_inspection_failures_count_summary.csv')
+
+mv_rent_fishnet_half_mi <- apply_fishnet(
+  mv_rent_sf_grid, fishnet_half_mile, fn05_centroid, crs=NJ_PLANAR
+  )
+mv_rent_fishnet_half_mi <- mv_rent_fishnet_half_mi %>% 
+  filter(year %in% c(2017:2019))
+
+mv_rent_fishnet_ls <- apply_fishnet(
+  mv_rent_sf_ls, fishnet_landscan, fnls_centroid, crs=NJ_PLANAR
+  )
+mv_rent_fishnet_ls <- mv_rent_fishnet_ls %>% filter(year == 2019)
+
+mv_rent_fishnet_final <- bind_rows(
+  mv_rent_fishnet_half_mi, mv_rent_fishnet_ls
+  ) %>%
+  select(Rental.Id, Unit, Block.Lot.Qual, Property.Location, 
+         Registration.Date, Unit.Status, Unit.Status.Date, Status,
+         Status.Date, Description, Activity.Type, Activity.Inspector,
+         Activity.Date, Activity.Start.Time, Activity.End.Time,
+         Activity.Status, Comment, corrected_status, address, city,
+         zip_code, state, year,
+         matched_address, net_id, net_pop, include_area, fn_width,
+         in_Commercial_Township, in_Bridgeton, in_Millville, in_Vineland,
+         data_lon, data_lat, fishnet_centroid_lon, fishnet_centroid_lat)
+```
+
+We are able to keep the following observations from the Millville rental inspection failures dataset, excluding values that did not geocode within the municipal boundaries of Millville:
+```{r mv_rent_table, results='markup', echo=TRUE, cache=TRUE}
+mv_summary <- mv_rent_fishnet_final %>% 
+  group_by(fn_width, year, Activity.Type) %>% 
+  summarise(n=n()) %>%
+  mutate(Activity.Type = case_when(
+    Activity.Type == 'MI' ~ 'Move-in',
+    Activity.Type == 'NEW' ~ 'New registration',
+    Activity.Type == 'RCI' ~ 'Rental compliant inpsection',
+    Activity.Type == 'FCL' ~ 'FCL (no description avail.)',
+    Activity.Type == 'REX' ~ 'Annual reinspection',
+    Activity.Type == 'INS' ~ 'INS (no description avail.)',
+    Activity.Type == 'RI' ~ 'Reinspection after failure'
+  )) %>% pivot_wider(
+    id_cols=c(fn_width, year), 
+    names_from = c(Activity.Type), 
+    values_from = c(n)) 
+
+mv_summary <- mv_summary %>% 
+  rowwise() %>% 
+  mutate(
+  'Total' = sum(c_across(tidyselect::all_of(c(
+    'Move-in', 'New registration', 'Rental compliant inpsection',
+    'FCL (no description avail.)', 'Annual reinspection', 
+    'INS (no description avail.)', 'Reinspection after failure'))),
+    na.rm=TRUE)) 
+
+kable(mv_summary, caption="Millville rental inspection failures data by year.")
+
+mv_addr_summary <- mv_rent_fishnet_final %>% 
+  group_by(fn_width, year, Property.Location) %>% 
+  summarise(n=n()) %>% group_by(fn_width, year) %>%
+  summarise(n_unique = n())
+
+mv_total_summary <- mv_rent_fishnet_final %>% 
+  group_by(fn_width, year) %>% 
+  summarise(n=n())
+
+mv_addr_final_summary <- left_join(
+  mv_addr_summary, mv_total_summary,
+  on=c('fn_width', 'year')
+)
+
+kable(mv_addr_final_summary, caption="Millville rental inspection failures data by year.")
+kable(mv_rent_summary_raster)
+```
+
+```{r write-mvviol, eval=FALSE}
+write.csv(
+  mv_rent_fishnet_final,
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/Millville_rental_inspection_failures_all_geocoded_with_netid_nj_planar_esri_102311.csv',
+  quote=TRUE
+)
+```
+
+## Bridgeton violation data
+
+```{r bridgeton-violations, include=TRUE, echo=TRUE, cache=TRUE}
+bt_viol_gc_combined <- left_join(
+  bt_viol, bt_viol_gc, by=c("Location.Address"="input_address")
+  ) %>% mutate(
+    correct_match_indicator = if_else(
+      (match_indicator == 'Match'), 'Match', 'No_Match', missing='No_Match'
+    )
+  ) %>% mutate(
+    year=as.character(lubridate::year(Issue.Date))
+  ) %>% replace_na()
+
+bt_viol_matches <- bt_viol_gc_combined %>% 
+  group_by(year, correct_match_indicator) %>% 
+  summarise(n=n()) %>%
+  pivot_wider(id_cols='year', names_from='correct_match_indicator', values_from='n')
+
+bt_viol_sf <- create_incidents_sf(
+  bt_viol_gc_combined, initial_crs=NAD83, transform_crs=NJ_PLANAR
+  )
+
+bt_viol_sf_grid <- st_intersection(bt_viol_sf, bt_grid_boundary)
+bt_viol_sf_ls <- st_intersection(bt_viol_sf, bt_ls_boundary)
+
+in_bt_viol_grid_raster <- bt_viol_sf_grid %>%
+  group_by(year) %>% 
+  summarise(n=n()) %>% 
+  mutate(correct_match_indicator = 'Match') %>%
+  st_drop_geometry() %>%
+  rename('n_bt_raster'=n) %>%
+  mutate(fishnet_width = 'half mile')
+bt_viol_summary <- bt_viol_matches %>% 
+  left_join(in_bt_viol_grid_raster, on=c('year')) %>%
+  filter(year != 2020) %>% select(-correct_match_indicator)
+
+in_bt_viol_ls_raster <- bt_viol_sf_ls %>%
+  group_by(year) %>% 
+  summarise(n=n()) %>% 
+  mutate(correct_match_indicator = 'Match') %>%
+  st_drop_geometry() %>%
+  rename('n_bt_raster'=n) %>%
+  filter(year==2019) %>%
+  mutate(fishnet_width = 'landscan')
+bt_viol_summary_ls <- bt_viol_matches %>% 
+  left_join(in_bt_viol_ls_raster, on=c('year')) %>%
+  filter(year != 2020) %>% select(-correct_match_indicator)
+
+bt_viol_summary_raster <- bind_rows(bt_viol_summary, bt_viol_summary_ls) %>%
+  drop_na() %>% rename('final n'=n_bt_raster) %>%
+  rename('geocode match'=Match) %>% rename('no geocode match'=No_Match) %>%
+  rename('fishnet width'=fishnet_width) %>%
+  mutate(`outside Bridgeton` = `geocode match` - `final n`) %>%
+  select(`fishnet width`, year, `geocode match`, 
+         `no geocode match`, `outside Bridgeton`, `final n`)
+kable(bt_viol_summary_raster)
+
+write.csv(bt_viol_summary_raster, '~/PredictAlign/final_bridgeton_violations_inspection_failures_count_summary.csv')
+
+bt_viol_check <- ggmap(cumberland_bm) +
+  geom_sf(data=st_transform(bt_viol_sf_grid, crs=WGS84), inherit.aes=FALSE) +
+  geom_sf(data=st_transform(bt_grid_boundary, crs=WGS84), 
+          inherit.aes = FALSE, color='blue', alpha = 0.1)
+bt_viol_check # not run -- check that all the points are in cumberland county
+
+bt_viol_fishnet_half_mi <- apply_fishnet(
+  bt_viol_sf_grid, fishnet_half_mile, fn05_centroid, crs=NJ_PLANAR
+  )
+bt_viol_fishnet_half_mi <- bt_viol_fishnet_half_mi %>%
+  filter(year %in% c(2017:2019))
+
+bt_viol_fishnet_ls <- apply_fishnet(
+  bt_viol_sf_ls, fishnet_landscan, fnls_centroid, crs=NJ_PLANAR
+  )
+bt_viol_fishnet_ls <- bt_viol_fishnet_ls %>%
+  filter(year == 2019)
+
+bt_viol_fishnet_final <- bind_rows(bt_viol_fishnet_half_mi, bt_viol_fishnet_ls) %>%
+  select(Tracking.Number, Location.Address, Issue.Date, year, Statute, Statute.Number,
+         violation_type, Address, City, State, id, X.y, X.1, X.2, matched_address,
+         net_id, net_pop, include_area, fn_width,
+         in_Commercial_Township, in_Bridgeton, in_Millville, in_Vineland,
+         data_lon, data_lat, fishnet_centroid_lon, fishnet_centroid_lat)
+```
+
+We are able to keep the following observations from the Bridgeton violation dataset:
+```{r btv_table, results='markup', echo=TRUE, cache=TRUE}
+btv_summary <- bt_viol_fishnet_final %>% 
+  group_by(fn_width, year) %>% 
+  summarise(n=n())
+
+kable(btv_summary, caption="Bridgeton violation data by year and municipality.")
+kable(bt_viol_summary_raster)
+```
+
+```{r write-btviol, eval=FALSE}
+write.csv(
+  bt_viol_fishnet_final,
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/Bridgeton_violations_all_geocoded_with_netid_nj_planar_esri_102311.csv',
+  quote=TRUE
+)
+```
+
+## Risk and protective factor locations
+
+```{r risk-protective, include=TRUE, echo=TRUE}
+# assume CRS = WGS84
+crp <- st_as_sf(cumberland_risk_protective2, coords=c('Longitude', 'Latitude'), crs=WGS84)
+crp_planar <- st_transform(crp, crs=NJ_PLANAR)
+crp_planar$year <- NA
+
+time_independent_fn05_centroid <- fn05_centroid %>% 
+  filter(year==2017) %>%
+  select(net_id, fishnet_centroid_lon, fishnet_centroid_lat, fn_width, include_area) %>% 
+  distinct() %>%
+  mutate(year=NA)
+
+
+time_independent_fnls_centroid <- fnls_centroid %>% 
+  filter(year==2019) %>%
+  select(net_id, fishnet_centroid_lon, fishnet_centroid_lat, fn_width, include_area) %>% 
+  distinct() %>%
+  mutate(year=NA)
+
+crp_planar_grid <- st_intersection(crp_planar, all_grid_boundary)
+crp_planar_ls <- st_intersection(crp_planar, all_ls_boundary)
+
+test_all_grid <- ggmap(cumberland_bm) +
+  geom_sf(data=st_transform(all_grid_boundary, crs=WGS84), inherit.aes=FALSE)
+
+crp_summary_initial = tibble(
+  `fishnet width` = c('half mile', 'landscan'),
+  `raw count` = c(dim(crp_planar)[1], dim(crp_planar)[1]),
+  `inside study area` = c(dim(crp_planar_grid)[1], dim(crp_planar_ls)[1])
+)
+
+kable(crp_summary_initial)
+
+write.csv(crp_summary_initial, 
+          '~/PredictAlign/final_risk_protective_count_summary.csv')
+
+crp_planar_fishnet_half_mi <- apply_fishnet(
+  crp_planar_grid, fishnet_half_mile, time_independent_fn05_centroid, crs=NJ_PLANAR
+  )
+crp_planar_fishnet_ls <- apply_fishnet(
+  crp_planar_ls, fishnet_landscan, time_independent_fnls_centroid, crs=NJ_PLANAR
+  )
+
+crp_fishnet_final <- bind_rows(crp_planar_fishnet_half_mi, crp_planar_fishnet_ls) %>%
+  select(ABI.Number, Primary.SIC.4, Primary.SIC.6, PrimarySIC6.Description, Census.Tract,
+         County.Code, Census.Block,
+         net_id, include_area, fn_width,
+         in_Commercial_Township, in_Bridgeton, in_Millville, in_Vineland,
+         data_lon, data_lat, fishnet_centroid_lon, fishnet_centroid_lat)
+```
+
+We are able to keep the following observations from the risk and protective features dataset:
+```{r crp_table, results='markup', echo=TRUE, cache=TRUE}
+crp_summary <- crp_fishnet_final %>% group_by(fn_width) %>% summarise(n=n())
+
+kable(crp_summary, caption="Risk and protective factor location data by municipality.")
+kable(crp_summary_initial)
+```
+
+```{r write-crp, eval=FALSE}
+write.csv(
+  crp_fishnet_final,
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/risk_protect_factors_with_netid_nj_planar_esri_102311.csv',
+  quote=TRUE
+)
+```
+
+## New Jersey State Police crime data
+
+If data source is state police, filter on the union of Commercial Township, Bridgeton, Vineland and Millville grid cells. If the data source is Vineland, filter on the union of Vineland grid cells. If the data source is Millville, filter on the union of Millville grid cells.
+
+```{r state-police, include=TRUE, echo=TRUE}
+# check annual tallies
+st_pol_original <- st_pol %>% 
+  filter(Data.Source=='State Police') %>% 
+  mutate(year=as.character(
+    lubridate::year(readr::parse_datetime(Police.report.date, "%m/%d/%y"))
+  ))
+
+# only missing coords in state police data are from 2020 and are excluded anyway
+n_st_pol_with_coords <- st_pol_original %>%
+  mutate(correct_match_indicator = if_else(
+    (is.na(Latitude)), 'No_Match', 'Match')
+  ) %>%
+  group_by(year, correct_match_indicator) %>%
+  summarise(n=n()) %>%
+  mutate(Data.Source = 'State Police') %>%
+  rename('with coords' = n) %>%
+  select(-correct_match_indicator)
+
+mv_vl_original <- st_pol %>%
+  filter(Data.Source!='State Police') %>%
+  separate(
+      col=Police.report.number,
+      into=c('year', NA),
+      sep='-',
+      remove=FALSE) %>%
+  mutate(year=paste0('20', as.character(year)))
+st_pol_all_original <- bind_rows(st_pol_original, mv_vl_original)
+
+# reconcile with counts from DCF
+original_summary <- st_pol_all_original %>% 
+  group_by(Data.Source, year) %>% 
+  summarise(n=n()) %>%
+  left_join(n_st_pol_with_coords, on=c('year', 'Data.Source'))
+
+
+# assume CRS = WGS84
+st_pol_complete <- st_pol %>% filter(Data.Source == 'State Police') %>%
+  drop_na(Latitude, Longitude) %>% 
+  st_as_sf(coords=c('Longitude', 'Latitude'), crs=WGS84) %>%
+  st_transform(crs=NJ_PLANAR) %>% mutate(
+  year=as.character(
+    lubridate::year(
+      readr::parse_datetime(Police.report.date, "%m/%d/%y")
+      )
+    )
+  ) %>% filter(year %in% c(2017:2019))
+
+st_pol_grid <- st_intersection(st_pol_complete, all_grid_boundary)
+st_pol_ls <- st_intersection(st_pol_complete, all_ls_boundary)
+
+# this file was geocoded separately
+other_geocodes <- mv_vl_st_pol %>% 
+  filter(Data.Source != 'State Police') %>% 
+  mutate(correct_match_indicator = if_else(
+    (match_indicator == 'Match'), 'Match', 'No_Match', missing='No_Match')
+  ) %>%
+  separate(
+      col=Police.report.number,
+      into=c('year', NA),
+      sep='-',
+      remove=FALSE) %>%
+  mutate(
+    year=paste0('20', as.character(year))
+  ) %>%
+  rename('lon'=long)
+
+other_summary <- other_geocodes %>% 
+  group_by(year, Data.Source, correct_match_indicator) %>% 
+  summarise(n=n()) %>%
+  pivot_wider(id_cols=c('year', 'Data.Source'), 
+              names_from='correct_match_indicator', values_from='n')
+
+all_sp_summary <- left_join(original_summary, other_summary, on=c('year', 'Data.Source')) %>%
+  mutate(Match = coalesce(`with coords`, Match)) %>% 
+  select(-`with coords`)
+all_sp_summary[is.na(all_sp_summary)] <- 0
+
+other_geocodes_sf <- create_incidents_sf(
+  other_geocodes, initial_crs=NAD83, transform_crs=NJ_PLANAR
+  )
+
+mv_geocodes <- other_geocodes_sf %>% filter(Data.Source=='Cumberland-Millville')
+vl_geocodes <- other_geocodes_sf %>% filter(Data.Source=='Vineland')
+
+mv_geocodes_grid <- st_intersection(mv_geocodes, mv_grid_boundary)
+mv_geocodes_ls <- st_intersection(mv_geocodes, mv_ls_boundary)
+
+vl_geocodes_grid <- st_intersection(vl_geocodes, vl_grid_boundary)
+vl_geocodes_ls <- st_intersection(vl_geocodes, vl_ls_boundary)
+
+# clumping back up into one big happy dataset
+st_pol_grid <- bind_rows(st_pol_grid, mv_geocodes_grid, vl_geocodes_grid) %>% distinct()
+st_pol_ls <- bind_rows(st_pol_ls, mv_geocodes_ls, vl_geocodes_ls) %>% distinct()
+
+st_pol_grid_raster <- st_pol_grid %>%
+  group_by(year, Data.Source) %>% 
+  summarise(n=n()) %>% 
+  mutate(correct_match_indicator = 'Match') %>%
+  st_drop_geometry() %>%
+  rename('n_sp_raster'=n) %>%
+  mutate(fishnet_width = 'half mile')
+st_pol_grid_summary <- all_sp_summary %>% 
+  left_join(st_pol_grid_raster, on=c('year', 'Data.Source')) %>%
+  filter(year != 2020 & year != 2016) %>% select(-correct_match_indicator)
+
+st_pol_ls_raster <- st_pol_ls %>%
+  group_by(year, Data.Source) %>% 
+  summarise(n=n()) %>% 
+  mutate(correct_match_indicator = 'Match') %>%
+  st_drop_geometry() %>%
+  rename('n_sp_raster'=n) %>%
+  mutate(fishnet_width = 'landscan')
+st_pol_ls_summary <- all_sp_summary %>% 
+  left_join(st_pol_ls_raster, on=c('year', 'Data.Source')) %>%
+  filter(year == 2019) %>% select(-correct_match_indicator)
+
+st_pol_summary_raster <- bind_rows(st_pol_grid_summary, st_pol_ls_summary) %>%
+  drop_na() %>% rename('final n'=n_sp_raster) %>%
+  rename('geocode match'=Match) %>% rename('no geocode match'=No_Match) %>%
+  rename('fishnet width'=fishnet_width) %>%
+  rename('original count'=n) %>% rename('Data Source'=Data.Source) %>%
+  mutate(`outside area` = `geocode match` - `final n`) %>%
+  select(`Data Source`, `fishnet width`, year, `original count`, `geocode match`, 
+         `no geocode match`, `outside area`, `final n`)
+kable(st_pol_summary_raster)
+write.csv(st_pol_summary_raster, '~/PredictAlign/final_st_pol_mv_vl_crime_count_summary.csv')
+
+st_pol_fishnet_half_mi <- apply_fishnet(
+  st_pol_grid, fishnet_half_mile, fn05_centroid, crs=NJ_PLANAR
+  )
+st_pol_fishnet_half_mi <- st_pol_fishnet_half_mi %>%
+  filter(year %in% c(2017:2019)) %>% distinct()
+
+st_pol_fishnet_ls <- apply_fishnet(
+  st_pol_ls, fishnet_landscan, fnls_centroid, crs=NJ_PLANAR
+  )
+st_pol_fishnet_ls <- st_pol_fishnet_ls %>%
+  filter(year == 2019)
+
+st_pol_fishnet_final <- bind_rows(st_pol_fishnet_ls, st_pol_fishnet_half_mi) %>% 
+  select(Data.Source, Crime.Code, Police.report.number, Police.report.date, year, 
+         Police.report.time.of.day, Location..Address...Street.Number, 
+         Location..Address...Street.Name, County, Municipality,
+         net_id, net_pop, include_area, fn_width,
+         in_Commercial_Township, in_Bridgeton, in_Millville, in_Vineland,
+         data_lon, data_lat, fishnet_centroid_lon, fishnet_centroid_lat)
+```
+
+We are able to keep the following observations from the State Police crime dataset (all data sources combined):
+```{r sp_table, results='markup', echo=TRUE, cache=TRUE}
+stpol_summary <- st_pol_fishnet_final %>% 
+  group_by(fn_width, year, Data.Source) %>% 
+  summarise(n=n()) 
+
+stpol_summary_wide<- stpol_summary %>% 
+  pivot_wider(
+    id_cols=c(fn_width, year), names_from = c(Data.Source), values_from = c(n)
+    ) %>% 
+  rowwise() %>% mutate(
+  'Total' = sum(c_across(all_of(
+    c('Cumberland-Millville', 'Vineland', 'State Police'))), na.rm=TRUE))
+
+kable(stpol_summary_wide, caption="State Police crime data by year and municipality.")
+kable(st_pol_summary_raster)
+```
+
+There aren't any really obvious errors in the addresses that fail to geocode. However, almost all of them seem to be addresses with cardinal directions (North, South, East, West) as part of the street address. The address validation service recognizes these as valid addresses but the geocoder can't find them.
+
+```{r write-stpol, eval=FALSE}
+write.csv(
+  st_pol_fishnet_final,
+  '~/PredictAlign/PredictAlignFishnets/cleaned_data/St_Pol_crime_with_netid_nj_planar_esri_102311.csv',
+  quote=TRUE
+)
+```
+
+# Grid aggregated risk and protective data summaries
+
+## Create summary dataframe
+
+```{r summaries, include=TRUE, echo=TRUE, out.width='2000px'}
+bridgeton_crime_fishnet_final$source <- 'Bridgeton Crime'
+mv_viol_fishnet_final$source <- 'Millville Violations'
+mv_rent_fishnet_final$source <- 'Millville Failed Rental Inspections'
+bt_viol_fishnet_final$source <- 'Bridgeton Violations'
+crp_fishnet_final$source <- 'Risk/Protective Factors'
+crp_fishnet_final$year <- NA
+st_pol_only_fishnet_final <- st_pol_fishnet_final %>%
+  filter(Data.Source=='State Police') %>% rename('source' = Data.Source)
+mv_fishnet_final <- st_pol_fishnet_final %>% 
+  filter(Data.Source=='Cumberland-Millville') %>% rename('source' = Data.Source)
+vl_fishnet_final <- st_pol_fishnet_final %>% 
+  filter(Data.Source=='Vineland') %>% rename('source' = Data.Source)
+
+risk_protect_data <- list()
+risk_protect_data[[1]] <- bridgeton_crime_fishnet_final
+risk_protect_data[[2]] <- mv_viol_fishnet_final
+risk_protect_data[[3]] <- bt_viol_fishnet_final
+risk_protect_data[[4]] <- st_pol_only_fishnet_final
+risk_protect_data[[5]] <- crp_fishnet_final
+risk_protect_data[[6]] <- mv_fishnet_final
+risk_protect_data[[7]] <- vl_fishnet_final
+risk_protect_data[[8]] <- mv_rent_fishnet_final
+
+summary_cols <- c('net_id', 'source', 'fn_width', 'year')
+
+for(d in seq_along(risk_protect_data)){
+  summary_data <- risk_protect_data[[d]][, summary_cols]
+  summary_data <- summary_data %>% group_by_at(summary_cols) %>% summarise(n=sum(n()))
+  risk_protect_data[[d]] <- summary_data
+}
+
+risk_protect_summary <- bind_rows(risk_protect_data)
+risk_protect_landscan <- risk_protect_summary %>% 
+  filter(fn_width=='landscan') %>%
+  full_join(fishnet_landscan, by=c('net_id', 'fn_width')) %>%
+  st_as_sf(crs=NJ_PLANAR)
+risk_protect_half_mi <- risk_protect_summary %>% 
+  filter(fn_width=='0.5') %>%
+  full_join(fishnet_half_mile, by=c('net_id', 'fn_width')) %>%
+  st_as_sf(crs=NJ_PLANAR)
+```
+
+# EVERYTHING BELOW HERE NEEDS TO BE UPDATED!!!!
+the data are already filtered to remove "exclude" data points, so most of the maps don't make sense anymore.
+
+```{r save-summaries, eval=FALSE, include=FALSE}
+st_write(risk_protect_landscan, '~/PredictAlign/PredictAlignFishnets/all_risk_protect_summary_by_datasource_city_landscan_20220329_NJ_PLANAR.shp', delete_layer = TRUE)
+st_write(risk_protect_half_mi, '~/PredictAlign/PredictAlignFishnets/all_risk_protect_summary_by_datasource_city_half_mile_20220329_NJ_PLANAR.shp', delete_layer = TRUE)
+
+```
+
+### Distribution of data within municipalities of interest
+
+#### Half mile fishnet grid
+
+```{r urban-rural-halfmi, include=TRUE, cache=TRUE}
+area_summary_05 <- ggmap(cumberland_bm) +
+  geom_sf(
+    data=st_transform(risk_protect_half_mi, crs=WGS84), 
+    aes(fill=n), inherit.aes=FALSE) +
+  facet_grid(~include_area) +
+  scale_fill_viridis_c(option="E")
+area_summary_05
+```
+
+#### Landscan grid
+
+```{r urban-rural-ls, include=TRUE, cache=TRUE}
+area_summary_ls <- ggmap(cumberland_bm) +
+  geom_sf(
+    data=st_transform(risk_protect_landscan, crs=WGS84), 
+    aes(fill=n), inherit.aes=FALSE) +
+  facet_grid(~include_area) +
+  scale_fill_viridis_c(option="E")
+area_summary_ls
+```
+
+```{r save-summaries2, eval=FALSE, include=FALSE}
+st_write(risk_protect_ls_total, '~/PredictAlign/PredictAlignFishnets/all_risk_protect_summary_by_inclusion_landscan_20220329_NJ_PLANAR.shp')
+st_write(risk_protect_half_mi_total, '~/PredictAlign/PredictAlignFishnets/all_risk_protect_summary_by_inclusion_half_mile_20220329_NJ_PLANAR.shp')
+```
+
+```{r not-run, include=FALSE}
+# load urban areas shapefile
+municipalities <- st_read(
+  '~/PredictAlign/Municipal_Boundaries_of_NJ/Municipal_Boundaries_of_NJ.shp'
+  )
+municipality_names <- c("Commercial Township", "Bridgeton", "Millville", "Vineland")
+
+cumberland_cities <- municipalities %>% 
+  filter(NAME %in% municipality_names) %>% 
+  st_transform(crs=crs(risk_protect_half_mi))
+
+summary_fishnet <- bind_rows(risk_protect_landscan, risk_protect_half_mi)
+table(summary_fishnet$source)
+
+urban <- st_read('~/CooksProTX/spatial/tigris/usa_urban_areas/urban_areas_2019/urban_areas_2019.shp')
+
+nj_urban <- urban %>% 
+  filter(grepl('NJ', NAME10)) %>% 
+  st_transform(crs=WGS84)
+
+cumberland_urban <- cumberland %>% 
+  st_transform(crs=WGS84) %>%
+  st_intersection(nj_urban)
+
+risk_protect_half_mi_total$uniform_color = 'crime/violation data'
+risk_protect_half_mi_summary <- risk_protect_half_mi_total %>%
+  filter(include_data == 'Include')
+risk_protect_landscan_summary <- risk_protect_ls_total %>%
+  filter(include_data == 'Include')
+
+cols <- c(
+  "crime/violation data" = "#d95f02",
+  "Bridgeton, NJ Urban Cluster" = "#1b9e77",
+  "Laurel Lake, NJ Urban Cluster" = "#7570b3", 
+  "Vineland, NJ Urbanized Area" = "#e7298a"
+)
+
+source_year_05_2 <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=cumberland_urban, 
+    aes(fill=NAMELSAD10), 
+    inherit.aes=FALSE, 
+    alpha=0.5
+    ) +
+  geom_sf(
+    data=st_transform(risk_protect_half_mi_summary,crs=WGS84),
+    aes(fill=uniform_color),
+    inherit.aes=FALSE, alpha=0.1) +
+  scale_colour_manual(values = cols, aesthetics = c('color', 'fill')) +
+  theme(plot.title=element_text(size=14)) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 22, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 8, family = "sans"),
+    legend.text = element_text(size = 6, family = "sans"))
+
+source_year_05_2
+```
+
+## Risk and protective factors by source
+
+Filter to remove the "Excluded" data:
+
+```{r incl-only, include=TRUE}
+risk_protect_half_mi_include <- risk_protect_half_mi %>% filter(urban_area != 'Excluded')
+risk_protect_landscan_include <- risk_protect_landscan %>% filter(urban_area != 'Excluded')
+```
+
+### Half-mile grid risk and protective factors
+```{r half-mi-rp-map, include=TRUE, cache=TRUE}
+half_mi_urban <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(risk_protect_half_mi_include,crs=WGS84), 
+    aes(fill=source), inherit.aes=FALSE, alpha=1) +
+  facet_wrap(.~source) +
+  theme(plot.title=element_text(size=14)) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 22, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 8, family = "sans"),
+    legend.text = element_text(size = 6, family = "sans"))
+
+half_mi_urban
+```
+
+### Landscan risk and protective factors
+```{r landscan-rp-map, include=TRUE, cache=TRUE}
+
+landscan_urban <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(risk_protect_landscan_include,crs=WGS84), 
+    aes(fill=source), inherit.aes=FALSE, alpha=1) +
+  facet_wrap(.~source) +
+  theme(plot.title=element_text(size=14)) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 22, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 8, family = "sans"),
+    legend.text = element_text(size = 6, family = "sans"))
+
+landscan_urban
+```
+
+## Risk and protective factors by year
+
+These plots will exclude the risk and protective factor business locations data, which do not have temporal information.
+
+### Raw crime volume by year and source
+
+```{r crime-volume, include=TRUE, echo=TRUE}
+# Inspect crime volume (data volume) by data source
+bc_tally <- bridgeton_crime_sf %>% 
+  group_by(year) %>% 
+  summarise(n=sum(n())) %>% 
+  mutate(source='Bridgeton Crime')
+mv_tally <- mv_viol_sf %>% 
+  group_by(year) %>% 
+  summarise(n=sum(n())) %>% 
+  mutate(source='Millville Violations')
+bv_tally <- bt_viol_sf %>% 
+  group_by(year) %>% 
+  summarise(n=sum(n())) %>% 
+  mutate(source='Bridgeton Violations')
+st_tally <- st_pol_planar %>% 
+  group_by(year) %>% 
+  summarise(n=sum(n())) %>% 
+  mutate(source='NJ State Police Crime')
+mv_vl_st_tally <- mv_vl_st_pol_planar %>% 
+  group_by(year) %>% 
+  summarise(n=sum(n())) %>% 
+  mutate(source='Millville/Vineland (State Police)')
+
+annual_tallies <- bind_rows(bc_tally, mv_tally, bv_tally, st_tally, mv_vl_st_tally)
+
+g <- ggplot(annual_tallies %>% filter(year %in% 2017:2019), aes(x=year, y=n, fill=source)) + 
+  geom_bar(stat='identity', position="dodge") +
+theme(
+  axis.text.x = element_text(size=14),
+  axis.text.y = element_text(size=14),
+  text = element_text(size=14),
+  legend.title = element_text(size = 14, family = "sans"),
+  legend.text = element_text(size = 14, family = "sans")
+)
+g
+
+```
+
+### Half mile grid aggregated crime volume by year
+
+```{r halfmi-annual-crime-source, include=TRUE, cache=TRUE}
+municipalities <- st_read(
+  '~/PredictAlign/Municipal_Boundaries_of_NJ/Municipal_Boundaries_of_NJ.shp'
+  )
+municipality_names <- c("Commercial Township", "Bridgeton", "Millville", "Vineland")
+
+cumberland_cities <- municipalities %>% 
+  filter(NAME %in% municipality_names) %>% 
+  st_transform(crs=crs(risk_protect_half_mi))
+
+risk_protect_half_mi_summary <- risk_protect_half_mi_include %>%
+  filter(source != 'Risk/Protective Factors')
+
+source_year_05 <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(risk_protect_half_mi_summary,crs=WGS84), 
+    aes(fill=n), inherit.aes=FALSE, alpha=1) +
+  facet_grid(.~ year) +
+  theme(plot.title=element_text(size=14)) +
+  scale_fill_viridis_c(option="E") +
+  geom_sf(data=st_transform(cumberland_cities, crs=WGS84), 
+          inherit.aes=FALSE, color='black', fill=NA) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 22, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 8, family = "sans"),
+    legend.text = element_text(size = 6, family = "sans"))
+
+source_year_05
+```
+
+### Half mile grid aggregated crime volume by year and source, shared color bar
+
+```{r halfmi-yr-src-map, include=TRUE, cache=TRUE}
+map <- ggmap(cumberland_bm) + 
+    geom_sf(
+      data=st_transform(risk_protect_half_mi_summary,crs=WGS84), 
+      aes(fill=n), inherit.aes=FALSE, alpha=1) +
+    facet_grid(source ~ year) +
+    theme(plot.title=element_text(size=14)) +
+    scale_fill_viridis_c(option="E") +
+    geom_sf(data=st_transform(cumberland_cities, crs=WGS84), 
+          inherit.aes=FALSE, color='black', fill=NA) +
+    mapTheme() +
+    theme(
+      plot.title = element_text(size = 22, family = "sans", face = "plain", hjust = 0),
+      plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+      plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+      axis.line = element_blank(),
+      legend.title = element_text(size = 8, family = "sans"),
+      legend.text = element_text(size = 6, family = "sans")) 
+
+map
+```
+
+### Half mile grid aggregated crime volume by year and source, independent color bars
+
+```{r halfmi-yr-src-map2, include=TRUE, cache=TRUE}
+source_list = c("Bridgeton Crime", "Millville Violations", "Bridgeton Violations", "State Police", "Cumberland-Millville", "Vineland")
+
+map_list = list()
+for(i in seq_along(source_list)){
+  
+  map_data <- risk_protect_half_mi_include %>%
+  filter(source == source_list[i])
+  
+  map <- ggmap(cumberland_bm) + 
+    geom_sf(
+      data=st_transform(map_data,crs=WGS84), 
+      aes(fill=n), inherit.aes=FALSE, alpha=1) +
+    facet_grid(. ~ year) +
+    scale_fill_viridis_c(option="E") +
+    geom_sf(data=st_transform(cumberland_cities, crs=WGS84), 
+          inherit.aes=FALSE, color='black', fill=NA) +
+    theme(plot.title=element_text(size=14)) +
+    mapTheme() +
+    theme(
+      plot.title = element_text(size = 22, family = "sans", face = "plain", hjust = 0),
+      plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+      plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+      axis.line = element_blank(),
+      legend.title = element_text(size = 8, family = "sans"),
+      legend.text = element_text(size = 6, family = "sans")) +
+    labs(title=source_list[i])
+  
+  map_list[[i]] <- map
+}
+```
+
+```{r halfmi-show, include=TRUE}
+map_list[[1]]
+map_list[[2]]
+map_list[[3]]
+map_list[[4]]
+map_list[[5]]
+map_list[[6]]
+```
+### Landscan grid aggregated crime volume by year
+
+```{r landscan-annual-crime-source, include=TRUE, cache=TRUE}
+
+risk_protect_landscan_summary <- risk_protect_landscan_include %>%
+  filter(source != 'Risk/Protective Factors')
+
+source_year_ls <- ggmap(cumberland_bm) + 
+  geom_sf(
+    data=st_transform(risk_protect_landscan_summary,crs=WGS84), 
+    aes(fill=n), inherit.aes=FALSE, alpha=1) +
+  facet_grid(.~year) +
+  scale_fill_viridis_c(option="E") +
+  geom_sf(data=st_transform(cumberland_cities, crs=WGS84), 
+        inherit.aes=FALSE, color='black', fill=NA) +
+  theme(plot.title=element_text(size=14)) +
+  mapTheme() +
+  theme(
+    plot.title = element_text(size = 22, family = "sans", face = "plain", hjust = 0),
+    plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+    plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+    axis.line = element_blank(),
+    legend.title = element_text(size = 8, family = "sans"),
+    legend.text = element_text(size = 6, family = "sans"))
+
+source_year_ls
+```
+
+### Landscan grid aggregated crime volume by year and source, shared color bar
+
+```{r ls-src, include=TRUE, cache=TRUE}
+map <- ggmap(cumberland_bm) + 
+    geom_sf(
+      data=st_transform(risk_protect_landscan_summary,crs=WGS84), 
+      aes(fill=n), inherit.aes=FALSE, alpha=1) +
+    facet_wrap(~ source, nrow=2) +
+    theme(plot.title=element_text(size=14)) +
+    scale_fill_viridis_c(option="E") +
+    geom_sf(data=st_transform(cumberland_cities, crs=WGS84), 
+          inherit.aes=FALSE, color='black', fill=NA) +
+    mapTheme() +
+    theme(
+      plot.title = element_text(size = 22, family = "sans", face = "plain", hjust = 0),
+      plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+      plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+      axis.line = element_blank(),
+      legend.title = element_text(size = 8, family = "sans"),
+      legend.text = element_text(size = 6, family = "sans")) 
+
+map
+```
+
+### Landscan grid aggregated crime volume by year and source, independent color bars
+
+```{r ls-src2, include=TRUE, cache=TRUE}
+map_list_landscan = list()
+for(i in seq_along(source_list)){
+  
+  map_data <- risk_protect_landscan_summary %>%
+  filter(source == source_list[i])
+  
+  map <- ggmap(cumberland_bm) + 
+    geom_sf(
+      data=st_transform(map_data,crs=WGS84), 
+      aes(fill=n), inherit.aes=FALSE, alpha=1) +
+    facet_grid(. ~ year) +
+    scale_fill_viridis_c(option="E") +
+    geom_sf(data=st_transform(cumberland_cities, crs=WGS84), 
+          inherit.aes=FALSE, color='black', fill=NA) +
+    theme(plot.title=element_text(size=14)) +
+    mapTheme() +
+    theme(
+      plot.title = element_text(size = 22, family = "sans", face = "plain", hjust = 0),
+      plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+      plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+      axis.line = element_blank(),
+      legend.title = element_text(size = 8, family = "sans"),
+      legend.text = element_text(size = 6, family = "sans")) +
+    labs(title=source_list[i])
+  
+  map_list_landscan[[i]] <- map
+}
+```
+
+```{r ls-src-show, include=TRUE}
+map_list_landscan[[1]]
+map_list_landscan[[2]]
+map_list_landscan[[3]]
+map_list_landscan[[4]]
+map_list_landscan[[5]]
+map_list_landscan[[6]]
+```
